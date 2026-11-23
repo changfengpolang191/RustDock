@@ -212,6 +212,27 @@ impl Dock {
                         .fill_path(&block, &bp, FillRule::Winding, Transform::identity(), None);
                 }
             }
+
+            // 该程序有可见窗口时，图标下方画一个小圆点
+            if is_running(&self.items[i].exe) {
+                let cx = x + sz / 2.0;
+                let cy = win_h - self.pad * 0.45;
+                let r = (self.pad * 0.18).max(2.0);
+                let mut pb = PathBuilder::new();
+                pb.push_circle(cx, cy, r);
+                if let Some(dot) = pb.finish() {
+                    let mut dp = Paint::default();
+                    dp.set_color_rgba8(235, 235, 245, 235);
+                    dp.anti_alias = true;
+                    pm.as_mut().fill_path(
+                        &dot,
+                        &dp,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+            }
         }
 
         pm
@@ -539,6 +560,42 @@ unsafe fn show_taskbar() {
         SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
     );
     TASKBAR_HIDDEN = false;
+}
+
+// 当前有可见窗口的 exe 路径集合，用来在 Dock 上画运行指示点
+static mut RUNNING: Vec<String> = Vec::new();
+static mut DOCK_HWND: HWND = null_mut();
+
+unsafe extern "system" fn collect_running_proc(hwnd: HWND, _: LPARAM) -> BOOL {
+    if IsWindowVisible(hwnd) == 0 {
+        return 1;
+    }
+    if !GetWindow(hwnd, GW_OWNER).is_null() {
+        return 1;
+    }
+    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    if ex & (WS_EX_TOOLWINDOW as i32) != 0 {
+        return 1;
+    }
+    let mut pid: DWORD = 0;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid != 0 {
+        if let Some(p) = process_image_path(pid) {
+            if !RUNNING.iter().any(|x| x.eq_ignore_ascii_case(&p)) {
+                RUNNING.push(p);
+            }
+        }
+    }
+    1
+}
+
+unsafe fn refresh_running() {
+    RUNNING.clear();
+    EnumWindows(Some(collect_running_proc), 0);
+}
+
+fn is_running(exe: &str) -> bool {
+    unsafe { RUNNING.iter().any(|x| x.eq_ignore_ascii_case(exe)) }
 }
 
 unsafe fn redraw(hwnd: HWND) {
@@ -1612,9 +1669,13 @@ unsafe extern "system" fn topbar_wndproc(
     match msg {
         WM_ERASEBKGND => 1,
         WM_PAINT => 0,
-        // 时间每分钟变，用定时器定期重绘
+        // 时间每分钟变，用定时器定期重绘；顺便刷新运行中应用集合
         WM_TIMER => {
+            refresh_running();
             redraw_topbar(hwnd);
+            if !DOCK_HWND.is_null() {
+                redraw(DOCK_HWND);
+            }
             0
         }
         WM_MOUSEMOVE => {
@@ -1767,6 +1828,9 @@ fn main() {
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
 
+        // 先收集运行中应用，再画第一帧（指示点依赖这个集合）
+        DOCK_HWND = hwnd;
+        refresh_running();
         redraw(hwnd);
 
         // ── 顶部栏 ──
