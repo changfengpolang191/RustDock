@@ -1,0 +1,27 @@
+# ============================================================
+# RustDock 应用清单示例
+# 复制成 apps.txt 后按自己机器改路径，保存后重启 rustdock.exe 生效
+#
+# 格式：启动目标|图标来源
+#   第一列：exe 完整路径；也支持 shell: 协议
+#   第二列（可省略）：
+#     留空      -> 自动从第一列的 exe 抽 256x256 图标
+#     xxx.png   -> 用你放的图片（相对 apps.txt 所在目录）
+#     xxx.exe   -> 从那个程序抽图标（第一列不是 exe 时用）
+#   路径用单反斜杠
+# ============================================================
+
+# 文件夹：第一列给个目录，图标借用 explorer.exe
+C:\Users\Public|C:\Windows\explorer.exe
+
+C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
+C:\Program Files\Google\Chrome\Application\chrome.exe
+C:\Windows\System32\notepad.exe
+C:\Windows\System32\cmd.exe
+C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+C:\Windows\System32\calc.exe
+C:\Windows\System32\Taskmgr.exe
+
+# 自己装的应用照抄一行改路径即可，例如：
+# D:\SomeApp\app.exe
+# D:\SomeApp\app.exe|assets\app.png

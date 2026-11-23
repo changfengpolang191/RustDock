@@ -1,0 +1,4 @@
+[target.x86_64-pc-windows-msvc]
+# 静态链接 CRT：exe 不再依赖 vcruntime140.dll / ucrtbase.dll，
+# 拷到任何 Windows 10/11 上都能直接双击运行。
+rustflags = ["-C", "target-feature=+crt-static"]

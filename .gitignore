@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+*.exe.tmp
+
+# Cargo.lock 要提交：bin crate 锁死依赖版本，换机器构建结果一致
+/dist
+/apps.txt
