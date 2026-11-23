@@ -3169,14 +3169,20 @@ fn main() {
         let x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
         let y = (base_y - win_h).max(0);
 
-        // 优先用 AppBar 把任务栏挤走；失败再退回到移出屏幕
-        if appbar_register(hwnd) {
-            appbar_fill_screen(hwnd);
-            APPBAR_ON = true;
-            debug_log("appbar: 已注册并占满屏幕");
+        // 默认不动任务栏（保持它自己的自动隐藏），Dock 按停靠位置让位。
+        // 加 --hide-taskbar 才用 AppBar 把任务栏挤走 —— 副作用是系统工作区
+        // 被改写，开始菜单可能弹不出来，任务栏也会偶发闪一下。
+        if args.iter().any(|a| a == "--hide-taskbar") {
+            if appbar_register(hwnd) {
+                appbar_fill_screen(hwnd);
+                APPBAR_ON = true;
+                debug_log("appbar: 已注册并占满屏幕（--hide-taskbar）");
+            } else {
+                debug_log("appbar: 注册失败，回退到移出屏幕");
+                hide_taskbar();
+            }
         } else {
-            debug_log("appbar: 注册失败，回退到移出屏幕");
-            hide_taskbar();
+            debug_log("taskbar: 未启用隐藏，保持系统自动隐藏");
         }
 
         SetWindowPos(
