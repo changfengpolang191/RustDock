@@ -12,7 +12,7 @@
 # ============================================================
 
 # 文件夹：第一列给个目录，图标借用 explorer.exe
-C:\Users\Public|C:\Windows\explorer.exe
+C:\|C:\Windows\explorer.exe
 
 C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
 C:\Program Files\Google\Chrome\Application\chrome.exe
