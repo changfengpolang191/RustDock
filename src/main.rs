@@ -214,7 +214,7 @@ impl Dock {
             }
 
             // 该程序有可见窗口时，图标下方画一个小圆点
-            if is_running(&self.items[i].exe) {
+            if is_item_running(&self.items[i].exe) {
                 let cx = x + sz / 2.0;
                 let cy = win_h - self.pad * 0.45;
                 let r = (self.pad * 0.18).max(2.0);
@@ -598,6 +598,20 @@ fn is_running(exe: &str) -> bool {
     unsafe { RUNNING.iter().any(|x| x.eq_ignore_ascii_case(exe)) }
 }
 
+/// 判断某个清单项是否在运行。清单里可以写目录（比如用户主目录当"文件夹"用），
+/// 这时真正跑起来的是 explorer.exe，要按它匹配，否则永远点不亮指示点。
+fn match_exe_for(exe: &str) -> &str {
+    if Path::new(exe).is_dir() {
+        "C:\\Windows\\explorer.exe"
+    } else {
+        exe
+    }
+}
+
+fn is_item_running(exe: &str) -> bool {
+    is_running(match_exe_for(exe))
+}
+
 unsafe fn redraw(hwnd: HWND) {
     if let Some(dock) = DOCK.as_ref() {
         let pm = dock.render();
@@ -675,7 +689,7 @@ unsafe fn find_window_by_exe(exe: &str) -> Option<HWND> {
 
 /// 点图标：已经在跑就最小化/还原，没在跑就启动
 unsafe fn toggle_app(exe: &str) {
-    if let Some(hwnd) = find_window_by_exe(exe) {
+    if let Some(hwnd) = find_window_by_exe(match_exe_for(exe)) {
         if IsIconic(hwnd) != 0 {
             ShowWindow(hwnd, SW_RESTORE);
         } else {
