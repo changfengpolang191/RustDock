@@ -514,9 +514,9 @@ unsafe fn taskbar_window() -> HWND {
     FindWindowW(wide("Shell_TrayWnd").as_ptr(), null())
 }
 
-/// 隐藏任务栏：直接藏窗口。
-/// 只把它移出屏幕不够 —— Win11 的自动隐藏在鼠标触底时会把它拉回来显示，
-/// 所以这里改成 ShowWindow(SW_HIDE)。
+/// 把任务栏移出屏幕。
+/// Win11 的 XAML 任务栏自己管理可见性，SW_HIDE 会被它立刻覆盖回来，
+/// 所以只能改位置 —— 而且要靠定时器反复压。
 unsafe fn hide_taskbar() {
     let tray = taskbar_window();
     if tray.is_null() {
@@ -524,15 +524,51 @@ unsafe fn hide_taskbar() {
     }
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let mut rc: RECT = zeroed();
-    if GetWindowRect(tray, &mut rc) != 0 && rc.top < sh - 2 {
+    if GetWindowRect(tray, &mut rc) != 0 && rc.top > 0 && rc.top < sh - 2 {
         TASKBAR_ORIG = rc;
     }
-    ShowWindow(tray, SW_HIDE);
+    SetWindowPos(
+        tray,
+        null_mut(),
+        rc.left,
+        sh,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+    );
     TASKBAR_HIDDEN = true;
     debug_log(&format!(
-        "taskbar: 已隐藏，原位置 top={}",
+        "taskbar: 已移出屏幕，原位置 top={}",
         TASKBAR_ORIG.top
     ));
+}
+
+/// 定时器里反复调用：任务栏只要回到屏幕内就再推出去
+unsafe fn enforce_taskbar_hidden() {
+    if !TASKBAR_HIDDEN {
+        return;
+    }
+    let tray = taskbar_window();
+    if tray.is_null() {
+        return;
+    }
+    let sh = GetSystemMetrics(SM_CYSCREEN);
+    let mut rc: RECT = zeroed();
+    if GetWindowRect(tray, &mut rc) == 0 {
+        return;
+    }
+    // 顶边回到屏幕内就说明它被拉回来了
+    if rc.top < sh - 2 {
+        SetWindowPos(
+            tray,
+            null_mut(),
+            rc.left,
+            sh,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+    }
 }
 
 unsafe fn show_taskbar() {
@@ -2757,6 +2793,11 @@ unsafe extern "system" fn topbar_wndproc(
         WM_PAINT => 0,
         // 时间每分钟变，用定时器定期重绘；顺便刷新运行中应用集合
         WM_TIMER => {
+            // 200ms 那条：盯着任务栏，exporer 一露头就藏回去
+            if wparam == 2 {
+                enforce_taskbar_hidden();
+                return 0;
+            }
             refresh_running();
             // 托盘图标跨进程读取较重，两秒刷一次
             unsafe {
@@ -2960,6 +3001,16 @@ fn main() {
     use winapi::um::objbase::COINIT_APARTMENTTHREADED;
     // --install-autostart / --uninstall-autostart 只改注册表，不开界面
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let is_watchdog = args.iter().any(|a| a == "--watchdog");
+
+    // 每次启动重写日志。watchdog 也跑这个 main，不能让它把主进程的日志删掉
+    if !is_watchdog {
+        if let Ok(p) = std::env::current_exe() {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::remove_file(dir.join("rustdock.log"));
+            }
+        }
+    }
     if args.iter().any(|a| a == "--install-autostart") {
         std::process::exit(if unsafe { set_autostart(true) } { 0 } else { 1 });
     }
@@ -3129,6 +3180,8 @@ fn main() {
             );
         redraw_topbar(tb);
         SetTimer(tb, 1, 1000, None);
+        // 200ms 那条专门盯任务栏，explorer 一露头就藏回去
+        SetTimer(tb, 2, 200, None);
         TOPBAR_HWND = tb;
         // 启动时后台读一次亮度，不阻塞界面
         read_brightness_async();
