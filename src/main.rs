@@ -1921,26 +1921,9 @@ fn spawn_watchdog() {
 
 /// 恢复被 Dock 改过的系统状态
 unsafe fn restore_system_state() {
-    // 任务栏：显示并移回停靠位置
-    let tray = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
-    if !tray.is_null() {
-        ShowWindow(tray, SW_SHOW);
-        let sw = GetSystemMetrics(SM_CXSCREEN);
-        let sh = GetSystemMetrics(SM_CYSCREEN);
-        let top = taskbar_top_from_registry(sw, sh).unwrap_or(sh - 48);
-        SetWindowPos(
-            tray,
-            null_mut(),
-            0,
-            top,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
-        );
-    }
-    // 桌面图标
+    // Dock 只改过桌面图标这一项（任务栏一直是系统自己管的）
     set_desktop_icons_hidden(false);
-    debug_log("watchdog: 已恢复任务栏与桌面图标");
+    debug_log("watchdog: 已恢复桌面图标");
 }
 
 fn run_watchdog(parent_pid: u32) {
