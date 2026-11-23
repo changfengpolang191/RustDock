@@ -370,6 +370,75 @@ static mut DOCK: Option<Dock> = None;
 // 记录桌面图标是不是被我们隐藏的，退出时好恢复
 static mut HID_DESKTOP_ICONS: bool = false;
 
+// 通知器重启的消息（explorer 重启后任务栏会重新出现）
+static mut TASKBAR_CREATED_MSG: UINT = 0;
+static mut TASKBAR_HIDDEN: bool = false;
+static mut TASKBAR_ORIG: RECT = RECT {
+    left: 0,
+    top: 0,
+    right: 0,
+    bottom: 0,
+};
+
+unsafe fn taskbar_window() -> HWND {
+    FindWindowW(wide("Shell_TrayWnd").as_ptr(), null())
+}
+
+/// 把任务栏移到屏幕下方之外，并记住原位置
+unsafe fn hide_taskbar() {
+    let tray = taskbar_window();
+    if tray.is_null() {
+        return;
+    }
+    let sh = GetSystemMetrics(SM_CYSCREEN);
+    let mut rc: RECT = zeroed();
+    if GetWindowRect(tray, &mut rc) != 0 && rc.top < sh - 2 {
+        // 只有原本就在屏幕内才记录，避免把"已经被藏起来的位置"当成原始位置
+        TASKBAR_ORIG = rc;
+    }
+    SetWindowPos(
+        tray,
+        null_mut(),
+        rc.left,
+        sh,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+    );
+    TASKBAR_HIDDEN = true;
+    debug_log(&format!(
+        "taskbar: 已移出屏幕，原位置 top={}",
+        TASKBAR_ORIG.top
+    ));
+}
+
+unsafe fn show_taskbar() {
+    if !TASKBAR_HIDDEN {
+        return;
+    }
+    let tray = taskbar_window();
+    if tray.is_null() {
+        return;
+    }
+    let sh = GetSystemMetrics(SM_CYSCREEN);
+    // 原始位置不可用时贴屏幕底
+    let top = if TASKBAR_ORIG.top > 0 && TASKBAR_ORIG.top <= sh {
+        TASKBAR_ORIG.top
+    } else {
+        sh - 48
+    };
+    SetWindowPos(
+        tray,
+        null_mut(),
+        TASKBAR_ORIG.left,
+        top,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+    );
+    TASKBAR_HIDDEN = false;
+}
+
 unsafe fn redraw(hwnd: HWND) {
     if let Some(dock) = DOCK.as_ref() {
         let pm = dock.render();
@@ -732,6 +801,7 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_DESTROY => {
+            show_taskbar();
             if HID_DESKTOP_ICONS {
                 set_desktop_icons_hidden(false);
                 HID_DESKTOP_ICONS = false;
@@ -739,7 +809,14 @@ unsafe extern "system" fn wndproc(
             PostQuitMessage(0);
             0
         }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        m => {
+            // explorer 重启会重建任务栏，收到通知再藏一次
+            if TASKBAR_CREATED_MSG != 0 && m == TASKBAR_CREATED_MSG {
+                hide_taskbar();
+                return 0;
+            }
+            DefWindowProcW(hwnd, m, wparam, lparam)
+        }
     }
 }
 
@@ -1164,6 +1241,25 @@ fn main() {
     if args.iter().any(|a| a == "--uninstall-autostart") {
         std::process::exit(if unsafe { set_autostart(false) } { 0 } else { 1 });
     }
+    // 任务栏被移到屏幕外后 Dock 异常退出，用这个参数把它挪回来
+    if args.iter().any(|a| a == "--restore-taskbar") {
+        unsafe {
+            let tray = taskbar_window();
+            if !tray.is_null() {
+                let sh = GetSystemMetrics(SM_CYSCREEN);
+                SetWindowPos(
+                    tray,
+                    null_mut(),
+                    0,
+                    sh - 48,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
+        }
+        std::process::exit(0);
+    }
 
     unsafe {
         SetProcessDPIAware(); // 不声明就是 DPI 虚化，150% 缩放下会很糊
@@ -1180,6 +1276,8 @@ fn main() {
         };
 
         let hinst = GetModuleHandleW(null());
+        // explorer 重启后会广播这个消息
+        TASKBAR_CREATED_MSG = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
         let class: Vec<u16> = OsStr::new("RustDockWnd")
             .encode_wide()
             .chain(Some(0))
@@ -1223,8 +1321,13 @@ fn main() {
             return;
         }
 
-        // 让开任务栏，再留一点空隙；水平方向按整屏居中
-        let base_y = dock_base_y(scale);
+        // 隐藏系统任务栏，Dock 贴屏幕底
+        hide_taskbar();
+        let base_y = if TASKBAR_HIDDEN {
+            GetSystemMetrics(SM_CYSCREEN) - (MARGIN * scale) as i32
+        } else {
+            dock_base_y(scale)
+        };
         let x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
         let y = (base_y - win_h).max(0);
 
