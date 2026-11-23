@@ -929,6 +929,29 @@ unsafe extern "system" fn wndproc(
         WM_ERASEBKGND => 1,
         WM_PAINT => 0,
 
+        // 定时器：Dock 必须一直留在桌面层可见。
+        // Win+D「显示桌面」会把窗口真正隐藏（WS_VISIBLE 被清掉），
+        // 而不一定是最小化，所以直接检查可见性再恢复。
+        WM_TIMER => {
+            if wparam == 3 {
+                if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    SetWindowPos(
+                        hwnd,
+                        HWND_BOTTOM,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                    debug_log("dock: 被隐藏了，已恢复到桌面层");
+                }
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
         // 窗口里有大片透明区，不返回 HTTRANSPARENT 就会挡住底下的桌面和别的窗口
         WM_NCHITTEST => {
             let mut pt = POINT {
@@ -2734,9 +2757,24 @@ unsafe extern "system" fn topbar_wndproc(
         }
         // 时间每分钟变，用定时器定期重绘；顺便刷新运行中应用集合
         WM_TIMER => {
-            // 万一被最小化了（某些「显示桌面」实现直接 ShowWindow），拉回来
-            if IsIconic(hwnd) != 0 {
-                ShowWindow(hwnd, SW_RESTORE);
+            // 200ms 那条：只做守卫。Win+D「显示桌面」会把窗口真正隐藏
+            // （WS_VISIBLE 被清掉，不一定是最小化），这里立刻恢复。
+            if wparam == 2 {
+                if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                    debug_log("topbar: 被隐藏了，已恢复");
+                }
+                return 0;
             }
             refresh_running();
             // 托盘图标跨进程读取较重，两秒刷一次
@@ -3059,6 +3097,8 @@ fn main() {
 
         // 先收集运行中应用，再画第一帧（指示点依赖这个集合）
         DOCK_HWND = hwnd;
+        // 200ms 守卫：Win+D 之后把 Dock 恢复回来
+        SetTimer(hwnd, 3, 200, None);
         refresh_running();
         redraw(hwnd);
 
@@ -3110,6 +3150,8 @@ fn main() {
             );
         redraw_topbar(tb);
         SetTimer(tb, 1, 1000, None);
+        // 200ms 守卫：顶部栏被隐藏（Win+D 等）时立刻恢复
+        SetTimer(tb, 2, 200, None);
         TOPBAR_HWND = tb;
         // 启动时后台读一次亮度，不阻塞界面
         read_brightness_async();
