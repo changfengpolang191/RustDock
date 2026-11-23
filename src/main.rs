@@ -500,103 +500,6 @@ static mut DOCK: Option<Dock> = None;
 // 记录桌面图标是不是被我们隐藏的，退出时好恢复
 static mut HID_DESKTOP_ICONS: bool = false;
 
-// 通知器重启的消息（explorer 重启后任务栏会重新出现）
-static mut TASKBAR_CREATED_MSG: UINT = 0;
-static mut TASKBAR_HIDDEN: bool = false;
-static mut TASKBAR_ORIG: RECT = RECT {
-    left: 0,
-    top: 0,
-    right: 0,
-    bottom: 0,
-};
-
-unsafe fn taskbar_window() -> HWND {
-    FindWindowW(wide("Shell_TrayWnd").as_ptr(), null())
-}
-
-/// 把任务栏移出屏幕。
-/// Win11 的 XAML 任务栏自己管理可见性，SW_HIDE 会被它立刻覆盖回来，
-/// 所以只能改位置 —— 而且要靠定时器反复压。
-unsafe fn hide_taskbar() {
-    let tray = taskbar_window();
-    if tray.is_null() {
-        return;
-    }
-    let sh = GetSystemMetrics(SM_CYSCREEN);
-    let mut rc: RECT = zeroed();
-    if GetWindowRect(tray, &mut rc) != 0 && rc.top > 0 && rc.top < sh - 2 {
-        TASKBAR_ORIG = rc;
-    }
-    SetWindowPos(
-        tray,
-        null_mut(),
-        rc.left,
-        sh,
-        0,
-        0,
-        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
-    );
-    TASKBAR_HIDDEN = true;
-    debug_log(&format!(
-        "taskbar: 已移出屏幕，原位置 top={}",
-        TASKBAR_ORIG.top
-    ));
-}
-
-/// 定时器里反复调用：任务栏只要回到屏幕内就再推出去
-unsafe fn enforce_taskbar_hidden() {
-    if !TASKBAR_HIDDEN {
-        return;
-    }
-    let tray = taskbar_window();
-    if tray.is_null() {
-        return;
-    }
-    let sh = GetSystemMetrics(SM_CYSCREEN);
-    let mut rc: RECT = zeroed();
-    if GetWindowRect(tray, &mut rc) == 0 {
-        return;
-    }
-    // 顶边回到屏幕内就说明它被拉回来了
-    if rc.top < sh - 2 {
-        SetWindowPos(
-            tray,
-            null_mut(),
-            rc.left,
-            sh,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
-        );
-    }
-}
-
-unsafe fn show_taskbar() {
-    if !TASKBAR_HIDDEN {
-        return;
-    }
-    let tray = taskbar_window();
-    if tray.is_null() {
-        return;
-    }
-    ShowWindow(tray, SW_SHOW);
-    let sh = GetSystemMetrics(SM_CYSCREEN);
-    let top = if TASKBAR_ORIG.top > 0 && TASKBAR_ORIG.top <= sh {
-        TASKBAR_ORIG.top
-    } else {
-        sh - 48
-    };
-    SetWindowPos(
-        tray,
-        null_mut(),
-        TASKBAR_ORIG.left,
-        top,
-        0,
-        0,
-        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
-    );
-    TASKBAR_HIDDEN = false;
-}
 
 // 当前有可见窗口的 exe 路径集合，用来在 Dock 上画运行指示点
 static mut RUNNING: Vec<String> = Vec::new();
@@ -1111,11 +1014,6 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_DESTROY => {
-            if APPBAR_ON {
-                appbar_remove(hwnd);
-                APPBAR_ON = false;
-            }
-            show_taskbar();
             if HID_DESKTOP_ICONS {
                 set_desktop_icons_hidden(false);
                 HID_DESKTOP_ICONS = false;
@@ -1123,25 +1021,7 @@ unsafe extern "system" fn wndproc(
             PostQuitMessage(0);
             0
         }
-        m => {
-            // 系统重新布局时会通知 AppBar，重新声明占满屏幕
-            if m == WM_APPBAR_NOTIFY {
-                if APPBAR_ON {
-                    appbar_fill_screen(hwnd);
-                }
-                return 0;
-            }
-            // explorer 重启会重建任务栏，收到通知再处理一次
-            if TASKBAR_CREATED_MSG != 0 && m == TASKBAR_CREATED_MSG {
-                if APPBAR_ON {
-                    appbar_fill_screen(hwnd);
-                } else {
-                    hide_taskbar();
-                }
-                return 0;
-            }
-            DefWindowProcW(hwnd, m, wparam, lparam)
-        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
@@ -2044,47 +1924,6 @@ fn run_watchdog(parent_pid: u32) {
     std::process::exit(0);
 }
 
-// ── AppBar：把任务栏挤走 ──
-// Win11 的 XAML 任务栏不接受 SW_HIDE，反复移出屏幕也会被拉回来。
-// 标准做法是注册一个占满屏幕的 AppBar，系统重新布局时任务栏就无处安放了。
-const WM_APPBAR_NOTIFY: UINT = WM_USER + 1;
-
-unsafe fn appbar_register(hwnd: HWND) -> bool {
-    use winapi::um::shellapi::{APPBARDATA, ABM_NEW, SHAppBarMessage};
-
-    let mut abd: APPBARDATA = zeroed();
-    abd.cbSize = size_of::<APPBARDATA>() as DWORD;
-    abd.hWnd = hwnd;
-    abd.uCallbackMessage = WM_APPBAR_NOTIFY;
-    SHAppBarMessage(ABM_NEW, &mut abd) != 0
-}
-
-/// 声明占用整个屏幕，任务栏会被系统挤走
-unsafe fn appbar_fill_screen(hwnd: HWND) {
-    use winapi::um::shellapi::{APPBARDATA, ABE_TOP, ABM_SETPOS, SHAppBarMessage};
-
-    let mut abd: APPBARDATA = zeroed();
-    abd.cbSize = size_of::<APPBARDATA>() as DWORD;
-    abd.hWnd = hwnd;
-    abd.uEdge = ABE_TOP;
-    abd.rc.left = 0;
-    abd.rc.top = 0;
-    abd.rc.right = GetSystemMetrics(SM_CXSCREEN);
-    abd.rc.bottom = GetSystemMetrics(SM_CYSCREEN);
-    SHAppBarMessage(ABM_SETPOS, &mut abd);
-}
-
-unsafe fn appbar_remove(hwnd: HWND) {
-    use winapi::um::shellapi::{APPBARDATA, ABM_REMOVE, SHAppBarMessage};
-
-    let mut abd: APPBARDATA = zeroed();
-    abd.cbSize = size_of::<APPBARDATA>() as DWORD;
-    abd.hWnd = hwnd;
-    SHAppBarMessage(ABM_REMOVE, &mut abd);
-}
-
-static mut APPBAR_ON: bool = false;
-
 const IDM_OPEN_LOCATION: usize = 1;
 const IDM_QUIT: usize = 2;
 
@@ -2827,13 +2666,7 @@ fn do_action(act: Act) {
         Act::ToggleMute => unsafe { toggle_mute() },
         Act::WifiSettings => launch("ms-settings:network-wifi"),
         Act::BtSettings => launch("ms-settings:bluetooth"),
-        Act::ToggleTaskbar => unsafe {
-            if TASKBAR_HIDDEN {
-                show_taskbar();
-            } else {
-                hide_taskbar();
-            }
-        },
+        Act::ToggleTaskbar => {}
         Act::NoOp => {}
     }
 }
@@ -2849,11 +2682,6 @@ unsafe extern "system" fn topbar_wndproc(
         WM_PAINT => 0,
         // 时间每分钟变，用定时器定期重绘；顺便刷新运行中应用集合
         WM_TIMER => {
-            // 200ms 那条：盯着任务栏，exporer 一露头就藏回去
-            if wparam == 2 {
-                enforce_taskbar_hidden();
-                return 0;
-            }
             refresh_running();
             // 托盘图标跨进程读取较重，两秒刷一次
             unsafe {
@@ -3080,25 +2908,6 @@ fn main() {
         }
         std::process::exit(0);
     }
-    // 任务栏被移到屏幕外后 Dock 异常退出，用这个参数把它挪回来
-    if args.iter().any(|a| a == "--restore-taskbar") {
-        unsafe {
-            let tray = taskbar_window();
-            if !tray.is_null() {
-                let sh = GetSystemMetrics(SM_CYSCREEN);
-                SetWindowPos(
-                    tray,
-                    null_mut(),
-                    0,
-                    sh - 48,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
-                );
-            }
-        }
-        std::process::exit(0);
-    }
 
     unsafe {
         // Core Audio 等 COM 接口必须先初始化，否则 CoCreateInstance 返回
@@ -3119,8 +2928,6 @@ fn main() {
         };
 
         let hinst = GetModuleHandleW(null());
-        // explorer 重启后会广播这个消息
-        TASKBAR_CREATED_MSG = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
         let class: Vec<u16> = OsStr::new("RustDockWnd")
             .encode_wide()
             .chain(Some(0))
@@ -3164,26 +2971,10 @@ fn main() {
             return;
         }
 
-        // Dock 始终按任务栏停靠位置让出空隙
+        // Dock 始终按任务栏停靠位置让出空隙，不碰系统任务栏
         let base_y = dock_base_y(scale);
         let x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
         let y = (base_y - win_h).max(0);
-
-        // 默认不动任务栏（保持它自己的自动隐藏），Dock 按停靠位置让位。
-        // 加 --hide-taskbar 才用 AppBar 把任务栏挤走 —— 副作用是系统工作区
-        // 被改写，开始菜单可能弹不出来，任务栏也会偶发闪一下。
-        if args.iter().any(|a| a == "--hide-taskbar") {
-            if appbar_register(hwnd) {
-                appbar_fill_screen(hwnd);
-                APPBAR_ON = true;
-                debug_log("appbar: 已注册并占满屏幕（--hide-taskbar）");
-            } else {
-                debug_log("appbar: 注册失败，回退到移出屏幕");
-                hide_taskbar();
-            }
-        } else {
-            debug_log("taskbar: 未启用隐藏，保持系统自动隐藏");
-        }
 
         SetWindowPos(
             hwnd,
@@ -3250,8 +3041,6 @@ fn main() {
             );
         redraw_topbar(tb);
         SetTimer(tb, 1, 1000, None);
-        // 200ms 那条专门盯任务栏，explorer 一露头就藏回去
-        SetTimer(tb, 2, 200, None);
         TOPBAR_HWND = tb;
         // 启动时后台读一次亮度，不阻塞界面
         read_brightness_async();
