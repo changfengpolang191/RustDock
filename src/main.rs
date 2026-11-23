@@ -564,6 +564,7 @@ unsafe fn show_taskbar() {
 
 // 当前有可见窗口的 exe 路径集合，用来在 Dock 上画运行指示点
 static mut RUNNING: Vec<String> = Vec::new();
+static mut RUN_LOG_COUNT: u32 = 0;
 static mut DOCK_HWND: HWND = null_mut();
 
 /// 桌面、任务栏这些 shell 自己的窗口也是 explorer.exe 的，
@@ -587,6 +588,28 @@ unsafe fn is_shell_window(hwnd: HWND) -> bool {
     )
 }
 
+/// explorer.exe 有很多窗口（桌面、任务栏、各种宿主），
+/// 只有 CabinetWClass 才是用户眼里的「文件资源管理器窗口」
+const EXPLORER_EXE: &str = "C:\\Windows\\explorer.exe";
+
+unsafe fn is_folder_window(hwnd: HWND) -> bool {
+    let mut cls = [0u16; 64];
+    let n = GetClassNameW(hwnd, cls.as_mut_ptr(), 64);
+    if n <= 0 {
+        return false;
+    }
+    let name = String::from_utf16_lossy(&cls[..n as usize]);
+    name == "CabinetWClass" || name == "ExploreWClass"
+}
+
+/// 这个窗口是否算作「某程序真的在运行」
+unsafe fn counts_as_running(hwnd: HWND, exe: &str) -> bool {
+    if exe.eq_ignore_ascii_case(EXPLORER_EXE) {
+        return is_folder_window(hwnd);
+    }
+    true
+}
+
 unsafe extern "system" fn collect_running_proc(hwnd: HWND, _: LPARAM) -> BOOL {
     if IsWindowVisible(hwnd) == 0 {
         return 1;
@@ -605,6 +628,9 @@ unsafe extern "system" fn collect_running_proc(hwnd: HWND, _: LPARAM) -> BOOL {
     GetWindowThreadProcessId(hwnd, &mut pid);
     if pid != 0 {
         if let Some(p) = process_image_path(pid) {
+            if !counts_as_running(hwnd, &p) {
+                return 1;
+            }
             if !RUNNING.iter().any(|x| x.eq_ignore_ascii_case(&p)) {
                 RUNNING.push(p);
             }
@@ -616,6 +642,11 @@ unsafe extern "system" fn collect_running_proc(hwnd: HWND, _: LPARAM) -> BOOL {
 unsafe fn refresh_running() {
     RUNNING.clear();
     EnumWindows(Some(collect_running_proc), 0);
+    // 启动后前几轮把收集结果写进日志，方便排查"指示点关不掉"这类问题
+    if RUN_LOG_COUNT < 5 {
+        RUN_LOG_COUNT += 1;
+        debug_log(&format!("running[{}]: {:?}", RUNNING.len(), RUNNING));
+    }
 }
 
 fn is_running(exe: &str) -> bool {
@@ -693,6 +724,9 @@ unsafe extern "system" fn match_window_proc(hwnd: HWND, _: LPARAM) -> BOOL {
     if let Some(path) = process_image_path(pid) {
         if let Some(target) = MATCH_EXE.as_ref() {
             if path.eq_ignore_ascii_case(target) {
+                if !counts_as_running(hwnd, &path) {
+                    return 1;
+                }
                 MATCH_HWND = hwnd;
                 return 0; // 找到就停
             }
