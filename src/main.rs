@@ -1795,16 +1795,32 @@ fn set_brightness_async(v: u16) {
         BRIGHTNESS = v;
     }
     std::thread::spawn(move || {
-        let _ = std::process::Command::new("powershell")
+        // 必须用 Get-WmiObject：Get-CimInstance 拿到的是 CimInstance，
+        // 它不携带 WMI 方法，.WmiSetBrightness() 会直接报"不包含该方法"
+        let out = std::process::Command::new("powershell")
             .args([
                 "-NoProfile",
                 "-Command",
                 &format!(
-                    "(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods).WmiSetBrightness(1,{})",
+                    "(Get-WmiObject -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods).WmiSetBrightness(1,{})",
                     v
                 ),
             ])
             .output();
+        match out {
+            Ok(o) => {
+                if !o.status.success() {
+                    debug_log(&format!(
+                        "brightness: 设置 {} 失败 {}",
+                        v,
+                        String::from_utf8_lossy(&o.stderr)
+                    ));
+                } else {
+                    debug_log(&format!("brightness: 已设为 {}", v));
+                }
+            }
+            Err(e) => debug_log(&format!("brightness: 启动 PowerShell 失败 {}", e)),
+        }
     });
 }
 
