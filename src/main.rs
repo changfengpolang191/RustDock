@@ -930,23 +930,23 @@ unsafe extern "system" fn wndproc(
         WM_PAINT => 0,
 
         // 定时器：Dock 必须一直留在桌面层可见。
-        // Win+D「显示桌面」会把窗口真正隐藏（WS_VISIBLE 被清掉），
-        // 而不一定是最小化，所以直接检查可见性再恢复。
+        // Win+D「显示桌面」可能清掉 WS_VISIBLE、可能最小化、也可能只是把
+        // 桌面窗口提到前面把 Dock 压到看不见 —— 三种都覆盖，每轮无条件修正。
         WM_TIMER => {
             if wparam == 3 {
                 if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
                     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                    SetWindowPos(
-                        hwnd,
-                        HWND_BOTTOM,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
-                    debug_log("dock: 被隐藏了，已恢复到桌面层");
+                    debug_log("dock: 被隐藏/最小化，已恢复");
                 }
+                SetWindowPos(
+                    hwnd,
+                    HWND_BOTTOM,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
                 return 0;
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
