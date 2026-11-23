@@ -501,6 +501,13 @@ static mut DOCK: Option<Dock> = None;
 static mut HID_DESKTOP_ICONS: bool = false;
 
 
+// 运行中的窗口列表，显示在顶部栏上（相当于任务栏）
+struct WinEntry {
+    hwnd: HWND,
+    title: String,
+}
+static mut WINDOWS: Vec<WinEntry> = Vec::new();
+
 // 当前有可见窗口的 exe 路径集合，用来在 Dock 上画运行指示点
 static mut RUNNING: Vec<String> = Vec::new();
 static mut RUN_LOG_COUNT: u32 = 0;
@@ -563,6 +570,10 @@ unsafe extern "system" fn collect_running_proc(hwnd: HWND, _: LPARAM) -> BOOL {
     if is_shell_window(hwnd) {
         return 1;
     }
+    // 别把自己的两个窗口也列进去
+    if hwnd == DOCK_HWND || hwnd == TOPBAR_HWND {
+        return 1;
+    }
     let mut pid: DWORD = 0;
     GetWindowThreadProcessId(hwnd, &mut pid);
     if pid != 0 {
@@ -570,8 +581,18 @@ unsafe extern "system" fn collect_running_proc(hwnd: HWND, _: LPARAM) -> BOOL {
             if !counts_as_running(hwnd, &p) {
                 return 1;
             }
+            // Dock 的运行指示点用
             if !RUNNING.iter().any(|x| x.eq_ignore_ascii_case(&p)) {
                 RUNNING.push(p);
+            }
+            // 顶部栏的窗口列表用
+            let mut tbuf = [0u16; 256];
+            let tn = GetWindowTextW(hwnd, tbuf.as_mut_ptr(), 256);
+            if tn > 0 {
+                let title = String::from_utf16_lossy(&tbuf[..tn as usize]);
+                if !title.trim().is_empty() && !WINDOWS.iter().any(|w| w.hwnd == hwnd) {
+                    WINDOWS.push(WinEntry { hwnd, title });
+                }
             }
         }
     }
@@ -580,6 +601,7 @@ unsafe extern "system" fn collect_running_proc(hwnd: HWND, _: LPARAM) -> BOOL {
 
 unsafe fn refresh_running() {
     RUNNING.clear();
+    WINDOWS.clear();
     EnumWindows(Some(collect_running_proc), 0);
     // 启动后前几轮把收集结果写进日志，方便排查"指示点关不掉"这类问题
     if RUN_LOG_COUNT < 5 {
@@ -1595,25 +1617,6 @@ static mut TRAY_ICONS: Vec<TrayIcon> = Vec::new();
 static mut TRAY_TICK: u32 = 0;
 static mut TOPBAR_HWND: HWND = null_mut();
 
-/// 当前前台窗口的标题，用来在菜单栏显示正在用的程序
-unsafe fn foreground_title() -> Option<String> {
-    let fg = GetForegroundWindow();
-    if fg.is_null() || fg == DOCK_HWND || fg == TOPBAR_HWND {
-        return None;
-    }
-    let mut buf = [0u16; 256];
-    let n = GetWindowTextW(fg, buf.as_mut_ptr(), 256);
-    if n <= 0 {
-        return None;
-    }
-    let s = String::from_utf16_lossy(&buf[..n as usize]);
-    if s.trim().is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
 unsafe fn tray_toolbar() -> HWND {
     let shell = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
     if shell.is_null() {
@@ -2201,26 +2204,41 @@ impl TopBar {
                 .fill_rect(h, &pp, Transform::identity(), None);
         }
 
-        // 当前应用标题：跟在「帮助」后面
-        if let Some(t) = unsafe { foreground_title() } {
-            let tx = self.plus_x
+        // 运行中的窗口列表（不只是 apps.txt 里的）
+        {
+            let mut x = self.plus_x
                 + self.plus_w
                 + self.gap
                 + text_width("帮助", self.font_px)
                 + self.gap;
-            let mut shown: String = t;
-            let max_w = 300.0 * self.scale;
-            while text_width(&shown, self.font_px) > max_w && shown.chars().count() > 1 {
-                shown.pop();
+            let limit = self.right_anchor() - 240.0 * self.scale;
+            let n = unsafe { WINDOWS.len().min(12) };
+            for i in 0..n {
+                let (hwnd, t) = unsafe {
+                    let w = &WINDOWS[i];
+                    (w.hwnd, w.title.clone())
+                };
+                let mut label = t;
+                while text_width(&label, self.font_px) > 150.0 * self.scale
+                    && label.chars().count() > 1
+                {
+                    label.pop();
+                }
+                let w = text_width(&label, self.font_px);
+                if x + w > limit {
+                    break;
+                }
+                let active = unsafe { GetForegroundWindow() } == hwnd;
+                let color = if active {
+                    [255, 255, 255, 255]
+                } else if self.hover == Some(100 + i) {
+                    [225, 225, 235, 255]
+                } else {
+                    [170, 170, 184, 255]
+                };
+                draw_text(&mut pm, &label, x, text_y, self.font_px, color);
+                x += w + self.gap;
             }
-            draw_text(
-                &mut pm,
-                &shown,
-                tx,
-                text_y,
-                self.font_px,
-                [165, 165, 178, 255],
-            );
         }
 
         // 右侧：时间 / 电量 / 音量，从右往左排
@@ -2380,6 +2398,33 @@ impl TopBar {
                 return Some(i);
             }
             cx += w + self.gap;
+        }
+        // 窗口列表
+        {
+            let mut cx = self.plus_x
+                + self.plus_w
+                + self.gap
+                + text_width("帮助", self.font_px)
+                + self.gap;
+            let limit = self.right_anchor() - 240.0 * self.scale;
+            let n = unsafe { WINDOWS.len().min(12) };
+            for i in 0..n {
+                let t = unsafe { WINDOWS[i].title.clone() };
+                let mut label = t;
+                while text_width(&label, self.font_px) > 150.0 * self.scale
+                    && label.chars().count() > 1
+                {
+                    label.pop();
+                }
+                let w = text_width(&label, self.font_px);
+                if cx + w > limit {
+                    break;
+                }
+                if x >= cx - 4.0 && x <= cx + w + 4.0 {
+                    return Some(100 + i);
+                }
+                cx += w + self.gap;
+            }
         }
         // 亮度
         if let Some(s) = self.bright_text() {
@@ -2680,8 +2725,19 @@ unsafe extern "system" fn topbar_wndproc(
     match msg {
         WM_ERASEBKGND => 1,
         WM_PAINT => 0,
+        // Win+D「显示桌面」会最小化所有窗口，顶部栏要留在原地
+        WM_SYSCOMMAND => {
+            if (wparam & 0xFFF0) == SC_MINIMIZE {
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         // 时间每分钟变，用定时器定期重绘；顺便刷新运行中应用集合
         WM_TIMER => {
+            // 万一被最小化了（某些「显示桌面」实现直接 ShowWindow），拉回来
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
             refresh_running();
             // 托盘图标跨进程读取较重，两秒刷一次
             unsafe {
@@ -2830,6 +2886,19 @@ unsafe extern "system" fn topbar_wndproc(
                 None => None,
             };
             if let Some(i) = act {
+                // 100 以上是窗口列表
+                if i >= 100 {
+                    if let Some(w) = unsafe { WINDOWS.get(i - 100) } {
+                        unsafe {
+                            if IsIconic(w.hwnd) != 0 {
+                                ShowWindow(w.hwnd, SW_RESTORE);
+                            }
+                            SetForegroundWindow(w.hwnd);
+                        }
+                    }
+                    redraw_topbar(hwnd);
+                    return 0;
+                }
                 // 10 以上是托盘图标，转发点击给对应程序
                 if i >= 10 {
                     unsafe { click_tray(i - 10) };
