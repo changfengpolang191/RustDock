@@ -1835,6 +1835,87 @@ fn draw_slider_panel(pm: &mut Pixmap, sx: f32, sy: f32, sw: f32, sh: f32, v: f32
     }
 }
 
+// ── 守护进程 ──
+// Dock 启动后 spawn 一个自己去等它的句柄，Dock 一退出（崩溃、被强杀都算）
+// 就恢复任务栏和桌面图标。这个进程只有一个等待句柄，不建窗口、不初始化 COM。
+fn spawn_watchdog() {
+    use winapi::um::processthreadsapi::GetCurrentProcessId;
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let pid = unsafe { GetCurrentProcessId() };
+    match std::process::Command::new(exe)
+        .arg("--watchdog")
+        .arg(pid.to_string())
+        .spawn()
+    {
+        Ok(_) => debug_log(&format!("watchdog: 已启动，监视 pid={}", pid)),
+        Err(e) => debug_log(&format!("watchdog: 启动失败 {}", e)),
+    }
+}
+
+/// 恢复被 Dock 改过的系统状态
+unsafe fn restore_system_state() {
+    // 任务栏：显示并移回停靠位置
+    let tray = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
+    if !tray.is_null() {
+        ShowWindow(tray, SW_SHOW);
+        let sw = GetSystemMetrics(SM_CXSCREEN);
+        let sh = GetSystemMetrics(SM_CYSCREEN);
+        let top = taskbar_top_from_registry(sw, sh).unwrap_or(sh - 48);
+        SetWindowPos(
+            tray,
+            null_mut(),
+            0,
+            top,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+    }
+    // 桌面图标
+    set_desktop_icons_hidden(false);
+    debug_log("watchdog: 已恢复任务栏与桌面图标");
+}
+
+fn run_watchdog(parent_pid: u32) {
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::synchapi::WaitForSingleObject;
+    use winapi::um::winnt::SYNCHRONIZE;
+
+    const INFINITE: u32 = 0xFFFFFFFF;
+    unsafe {
+        let h = OpenProcess(SYNCHRONIZE, 0, parent_pid);
+        if h.is_null() {
+            // 打不开就用轮询兜底
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let probe = OpenProcess(SYNCHRONIZE, 0, parent_pid);
+                if probe.is_null() {
+                    break;
+                }
+                CloseHandle(probe);
+            }
+        } else {
+            WaitForSingleObject(h, INFINITE);
+            CloseHandle(h);
+        }
+
+        // 给新实例一点时间；如果 Dock 已经重新起来了就别捣乱
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let cls = wide("RustDockWnd");
+        if !FindWindowW(cls.as_ptr(), null()).is_null() {
+            debug_log("watchdog: 新实例已在运行，跳过恢复");
+        } else {
+            restore_system_state();
+        }
+    }
+    // 恢复完立刻退出，不再走 main 的收尾流程
+    std::process::exit(0);
+}
+
 const IDM_OPEN_LOCATION: usize = 1;
 const IDM_QUIT: usize = 2;
 
@@ -2808,6 +2889,13 @@ fn main() {
     if args.iter().any(|a| a == "--uninstall-autostart") {
         std::process::exit(if unsafe { set_autostart(false) } { 0 } else { 1 });
     }
+    // 守护进程模式：等目标进程退出后恢复系统状态
+    if let Some(pos) = args.iter().position(|a| a == "--watchdog") {
+        if let Some(pid) = args.get(pos + 1).and_then(|s| s.parse::<u32>().ok()) {
+            run_watchdog(pid);
+        }
+        std::process::exit(0);
+    }
     // 任务栏被移到屏幕外后 Dock 异常退出，用这个参数把它挪回来
     if args.iter().any(|a| a == "--restore-taskbar") {
         unsafe {
@@ -2973,6 +3061,8 @@ fn main() {
         if set_desktop_icons_hidden(true) {
             HID_DESKTOP_ICONS = true;
         }
+        // 起一个守护进程，Dock 意外退出时把任务栏和桌面图标恢复回去
+        spawn_watchdog();
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
