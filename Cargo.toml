@@ -16,6 +16,8 @@ winapi = { version = "0.3", features = [
     "shellapi",
     "winreg",
     "winnt",
+    "processthreadsapi",
+    "handleapi",
     "minwindef",
     "windef",
 ] }

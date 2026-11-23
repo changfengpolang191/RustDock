@@ -367,11 +367,6 @@ unsafe fn present(hwnd: HWND, pm: &Pixmap) {
 
 static mut DOCK: Option<Dock> = None;
 
-// Dock 平时待在桌面层（HWND_BOTTOM，普通窗口能盖住它），
-// 鼠标进入热区才提到最上层。用定时器轮询是因为：窗口在底层时收不到鼠标消息。
-const TIMER_PROBE: usize = 1;
-const PROBE_MS: UINT = 60;
-static mut RAISED: bool = false;
 // 记录桌面图标是不是被我们隐藏的，退出时好恢复
 static mut HID_DESKTOP_ICONS: bool = false;
 
@@ -382,77 +377,87 @@ unsafe fn redraw(hwnd: HWND) {
     }
 }
 
-/// 前台窗口是不是全屏应用 —— 全屏时不弹 Dock
-unsafe fn foreground_is_fullscreen() -> bool {
-    let fg = GetForegroundWindow();
-    if fg.is_null() {
-        return false;
+// 找窗口时用来传参（EnumWindows 的回调不能捕获环境）
+static mut MATCH_EXE: Option<String> = None;
+static mut MATCH_HWND: HWND = null_mut();
+
+/// 拿进程的 exe 完整路径
+unsafe fn process_image_path(pid: DWORD) -> Option<String> {
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::winbase::QueryFullProcessImageNameW;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
+    let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+    if h.is_null() {
+        return None;
     }
-    let mut rc: RECT = zeroed();
-    if GetWindowRect(fg, &mut rc) == 0 {
-        return false;
+    let mut buf = [0u16; 512];
+    let mut size = buf.len() as DWORD;
+    let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
+    CloseHandle(h);
+    if ok == 0 {
+        return None;
     }
-    let sw = GetSystemMetrics(SM_CXSCREEN);
-    let sh = GetSystemMetrics(SM_CYSCREEN);
-    if !(rc.left <= 0 && rc.top <= 0 && rc.right >= sw && rc.bottom >= sh) {
-        return false;
-    }
-    // 桌面本身和任务栏也铺满屏幕，但它们不算全屏应用
-    let mut cls = [0u16; 64];
-    let n = GetClassNameW(fg, cls.as_mut_ptr(), 64);
-    if n <= 0 {
-        return true;
-    }
-    let name = String::from_utf16_lossy(&cls[..n as usize]);
-    !matches!(
-        name.as_str(),
-        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Button"
-    )
+    Some(String::from_utf16_lossy(&buf[..size as usize]))
 }
 
-/// 轮询鼠标：进热区就把窗口提到最上层，离开就压回桌面层
-unsafe fn probe_cursor(hwnd: HWND) {
-    let mut pt = POINT { x: 0, y: 0 };
-    if GetCursorPos(&mut pt) == 0 {
-        return;
+unsafe extern "system" fn match_window_proc(hwnd: HWND, _: LPARAM) -> BOOL {
+    if IsWindowVisible(hwnd) == 0 {
+        return 1;
     }
-    let mut wr: RECT = zeroed();
-    if GetWindowRect(hwnd, &mut wr) == 0 {
-        return;
+    // 只要无 owner 的顶层窗口
+    if !GetWindow(hwnd, GW_OWNER).is_null() {
+        return 1;
     }
-    let cx = (pt.x - wr.left) as f32;
-    let cy = (pt.y - wr.top) as f32;
-
-    let hot = !foreground_is_fullscreen()
-        && pt.x >= wr.left
-        && pt.x < wr.right
-        && pt.y >= wr.top
-        && pt.y < wr.bottom
-        && match DOCK.as_ref() {
-            Some(d) => d.clickable(cx, cy),
-            None => false,
-        };
-
-    if hot == RAISED {
-        return;
+    // 跳过工具窗口（托盘图标之类）
+    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    if ex & (WS_EX_TOOLWINDOW as i32) != 0 {
+        return 1;
     }
-    RAISED = hot;
 
-    SetWindowPos(
-        hwnd,
-        if hot { HWND_TOPMOST } else { HWND_BOTTOM },
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-    );
-
-    if let Some(d) = DOCK.as_mut() {
-        // 刚提上来时鼠标已经在上面了，先算一次放大，别等下一次 WM_MOUSEMOVE
-        d.hover = if hot { cx } else { -1.0e6 };
+    let mut pid: DWORD = 0;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid == 0 {
+        return 1;
     }
-    redraw(hwnd);
+    if let Some(path) = process_image_path(pid) {
+        if let Some(target) = MATCH_EXE.as_ref() {
+            if path.eq_ignore_ascii_case(target) {
+                MATCH_HWND = hwnd;
+                return 0; // 找到就停
+            }
+        }
+    }
+    1
+}
+
+/// 按 exe 完整路径找该程序的主窗口（不看 PID，程序重启过也能找到）
+unsafe fn find_window_by_exe(exe: &str) -> Option<HWND> {
+    MATCH_EXE = Some(exe.to_string());
+    MATCH_HWND = null_mut();
+    EnumWindows(Some(match_window_proc), 0);
+    MATCH_EXE = None;
+    if MATCH_HWND.is_null() {
+        None
+    } else {
+        Some(MATCH_HWND)
+    }
+}
+
+/// 点图标：已经在跑就最小化/还原，没在跑就启动
+unsafe fn toggle_app(exe: &str) {
+    if let Some(hwnd) = find_window_by_exe(exe) {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        } else {
+            ShowWindow(hwnd, SW_MINIMIZE);
+        }
+        SetForegroundWindow(hwnd);
+        debug_log(&format!("toggle: {} -> 切换窗口", exe));
+    } else {
+        launch(exe);
+    }
 }
 
 fn launch(cmd: &str) {
@@ -660,14 +665,6 @@ unsafe extern "system" fn wndproc(
         WM_ERASEBKGND => 1,
         WM_PAINT => 0,
 
-        // 定时器负责 z 序：窗口在底层时收不到鼠标消息，只能自己轮询
-        WM_TIMER => {
-            if wparam == TIMER_PROBE {
-                probe_cursor(hwnd);
-            }
-            0
-        }
-
         // 窗口里有大片透明区，不返回 HTTRANSPARENT 就会挡住底下的桌面和别的窗口
         WM_NCHITTEST => {
             let mut pt = POINT {
@@ -713,10 +710,12 @@ unsafe extern "system" fn wndproc(
         }
         WM_LBUTTONUP => {
             let (cx, cy) = (px(lparam), py(lparam));
-            if let Some(dock) = DOCK.as_ref() {
-                if let Some(i) = dock.hit(cx, cy) {
-                    launch(&dock.items[i].exe);
-                }
+            let target = match DOCK.as_ref() {
+                Some(dock) => dock.hit(cx, cy).map(|i| dock.items[i].exe.clone()),
+                None => None,
+            };
+            if let Some(exe) = target {
+                toggle_app(&exe);
             }
             0
         }
@@ -737,7 +736,6 @@ unsafe extern "system" fn wndproc(
                 set_desktop_icons_hidden(false);
                 HID_DESKTOP_ICONS = false;
             }
-            KillTimer(hwnd, TIMER_PROBE);
             PostQuitMessage(0);
             0
         }
@@ -1232,7 +1230,8 @@ fn main() {
 
         SetWindowPos(
             hwnd,
-            // 桌面层起步：普通窗口能盖住它。鼠标进热区时 probe_cursor 会提到最上层
+            // 桌面层：普通窗口能盖住它。没被遮挡时它就是这个位置最上层的窗口，
+            // 鼠标自然能命中；被遮挡时说明用户看不见它，也不该抢上来压住应用。
             HWND_BOTTOM,
             x,
             y,
@@ -1242,7 +1241,6 @@ fn main() {
         );
 
         redraw(hwnd);
-        SetTimer(hwnd, TIMER_PROBE, PROBE_MS, None);
 
         // 桌面图标由 Dock 接管，退出时还回去
         if set_desktop_icons_hidden(true) {
