@@ -628,6 +628,28 @@ fn is_item_running(exe: &str) -> bool {
     is_running(match_exe_for(exe))
 }
 
+/// 前台窗口是不是全屏应用 —— 全屏时 Dock 要藏起来，别压在游戏/视频上
+unsafe fn foreground_is_fullscreen() -> bool {
+    let fg = GetForegroundWindow();
+    if fg.is_null() || fg == DOCK_HWND || fg == TOPBAR_HWND {
+        return false;
+    }
+    let mut rc: RECT = zeroed();
+    if GetWindowRect(fg, &mut rc) == 0 {
+        return false;
+    }
+    let sw = GetSystemMetrics(SM_CXSCREEN);
+    let sh = GetSystemMetrics(SM_CYSCREEN);
+    if !(rc.left <= 0 && rc.top <= 0 && rc.right >= sw && rc.bottom >= sh) {
+        return false;
+    }
+    // 桌面本身和任务栏也铺满屏幕，但它们不算全屏应用
+    if is_shell_window(fg) {
+        return false;
+    }
+    true
+}
+
 unsafe fn redraw(hwnd: HWND) {
     if let Some(dock) = DOCK.as_ref() {
         let pm = dock.render();
@@ -934,6 +956,14 @@ unsafe extern "system" fn wndproc(
         // 桌面窗口提到前面把 Dock 压到看不见 —— 三种都覆盖，每轮无条件修正。
         WM_TIMER => {
             if wparam == 3 {
+                // 全屏应用在前台时 Dock 隐身，别挡着游戏/视频
+                if foreground_is_fullscreen() {
+                    if IsWindowVisible(hwnd) != 0 {
+                        ShowWindow(hwnd, SW_HIDE);
+                        debug_log("dock: 前台全屏，已隐藏");
+                    }
+                    return 0;
+                }
                 if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
                     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                     debug_log("dock: 被隐藏/最小化，已恢复");
