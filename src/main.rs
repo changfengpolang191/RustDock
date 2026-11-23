@@ -2773,20 +2773,26 @@ unsafe extern "system" fn topbar_wndproc(
             // 200ms 那条：只做守卫。Win+D「显示桌面」会把窗口真正隐藏
             // （WS_VISIBLE 被清掉，不一定是最小化），这里立刻恢复。
             if wparam == 2 {
+                // 顶部栏和 Dock 是一套东西，都在桌面层、都不压应用窗口
+                if foreground_is_fullscreen() {
+                    if IsWindowVisible(hwnd) != 0 {
+                        ShowWindow(hwnd, SW_HIDE);
+                    }
+                    return 0;
+                }
                 if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
                     ShowWindow(hwnd, SW_RESTORE);
                     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                    SetWindowPos(
-                        hwnd,
-                        HWND_TOPMOST,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
-                    debug_log("topbar: 被隐藏了，已恢复");
                 }
+                SetWindowPos(
+                    hwnd,
+                    HWND_BOTTOM,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
                 return 0;
             }
             refresh_running();
@@ -3072,9 +3078,11 @@ fn main() {
         RegisterClassExW(&wc);
 
         // LAYERED: 能用 UpdateLayeredWindow；TOOLWINDOW: 不进任务栏/Alt-Tab；
-        // TOPMOST: 一直在最前；NOACTIVATE: 点它不抢走前台窗口焦点
+        // NOACTIVATE: 点它不抢走前台窗口焦点
+        // 注意不能带 WS_EX_TOPMOST —— 带了这个样式，后面 SetWindowPos(HWND_BOTTOM)
+        // 也压不下去，窗口会一直盖在所有应用上面。
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class.as_ptr(),
             title.as_ptr(),
             WS_POPUP,
@@ -3138,7 +3146,7 @@ fn main() {
         };
         RegisterClassExW(&tb_wc);
         let tb = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             tb_class.as_ptr(),
             title.as_ptr(),
             WS_POPUP,
@@ -3154,7 +3162,7 @@ fn main() {
         if !tb.is_null() {
             SetWindowPos(
                 tb,
-                HWND_TOPMOST,
+                HWND_BOTTOM,
                 0,
                 0,
                 tb_w,
