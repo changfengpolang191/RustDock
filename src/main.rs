@@ -1456,7 +1456,8 @@ fn open_file_location(path: &str) {
 enum Act {
     NewFile,
     NewFolder,
-    Desktops,
+    ShowDesktops,
+    NewDesktop,
     Help,
 }
 
@@ -1468,24 +1469,47 @@ struct TopBar {
     pad: f32,
     gap: f32,
     font_px: f32,
+    // 桌面缩略图组的位置与尺寸（绘制和命中共用）
+    desk_x: f32,
+    desk_w: f32,
+    desk_h: f32,
+    plus_x: f32,
+    plus_w: f32,
 }
 
 impl TopBar {
     fn new(scale: f32) -> Self {
         let win_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        let pad = 14.0 * scale;
+        let gap = 22.0 * scale;
+        let font_px = TOPBAR_FONT_PX * scale;
+        let dk_w = 16.0 * scale;
+        let dk_h = 10.0 * scale;
+
+        // 先量出前两个按钮的宽度，桌面缩略图跟在它们后面
+        let b1 = text_width("新建文件", font_px);
+        let b2 = text_width("新建文件夹", font_px);
+        let desk_x = pad + b1 + gap + b2 + gap;
+        let desk_span = dk_w + 5.0 * scale * 2.0; // 两个层叠偏移
+        let plus_x = desk_x + desk_span + 8.0 * scale;
+
         TopBar {
             buttons: vec![
                 ("新建文件", Act::NewFile),
                 ("新建文件夹", Act::NewFolder),
-                ("桌面", Act::Desktops),
                 ("帮助", Act::Help),
             ],
             hover: None,
             win_w,
             win_h: (TOPBAR_H * scale).ceil() as i32,
-            pad: 14.0 * scale,
-            gap: 22.0 * scale,
-            font_px: TOPBAR_FONT_PX * scale,
+            pad,
+            gap,
+            font_px,
+            desk_x,
+            desk_w: dk_w,
+            desk_h: dk_h,
+            plus_x,
+            plus_w: 14.0 * scale,
         }
     }
 
@@ -1505,8 +1529,14 @@ impl TopBar {
         }
 
         let text_y = (self.win_h as f32 - self.font_px) / 2.0;
+
+        // 前两个按钮
         let mut x = self.pad;
         for (i, (label, _)) in self.buttons.iter().enumerate() {
+            if i == 2 {
+                // 「帮助」放在桌面组之后
+                x = self.plus_x + self.plus_w + self.gap;
+            }
             let color = if self.hover == Some(i) {
                 [255, 255, 255, 255]
             } else {
@@ -1514,6 +1544,57 @@ impl TopBar {
             };
             draw_text(&mut pm, label, x, text_y, self.font_px, color);
             x += text_width(label, self.font_px) + self.gap;
+        }
+
+        // 桌面缩略图组：三张层叠的小卡片，最上面那张代表当前桌面
+        let step = 5.0 * (self.desk_h / 10.0);
+        let cy = (self.win_h as f32 - self.desk_h) / 2.0;
+        let hover_desk = self.hover == Some(3);
+        let hover_plus = self.hover == Some(4);
+        for k in 0..3 {
+            let off = k as f32 * step;
+            let px = self.desk_x + off;
+            let py = cy + off * 0.5 - k as f32 * 1.0;
+            let block = rounded_rect(px, py, self.desk_w, self.desk_h, 2.0);
+            let mut bp = Paint::default();
+            let a = if hover_desk { 255 } else { 205 };
+            bp.set_color_rgba8(235, 235, 245, a);
+            bp.anti_alias = true;
+            pm.as_mut()
+                .fill_path(&block, &bp, FillRule::Winding, Transform::identity(), None);
+        }
+        // 最上面一张描个深色边，看起来是"当前"
+        let front = rounded_rect(self.desk_x + step * 2.0, cy + step - 2.0, self.desk_w, self.desk_h, 2.0);
+        let mut sp = Paint::default();
+        sp.set_color_rgba8(40, 40, 60, 220);
+        sp.anti_alias = true;
+        pm.as_mut().fill_path(
+            &front,
+            &sp,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+
+        // 加号（两条细矩形拼成十字）
+        let plus_cy = self.win_h as f32 / 2.0;
+        let mut pp = Paint::default();
+        let a = if hover_plus { 255 } else { 210 };
+        pp.set_color_rgba8(235, 235, 245, a);
+        pp.anti_alias = true;
+        let half = 4.0 * (self.desk_h / 10.0);
+        let cx = self.plus_x + self.plus_w / 2.0;
+        if let Some(v) =
+            tiny_skia::Rect::from_xywh(cx - half * 0.12, plus_cy - half, half * 0.24, half * 2.0)
+        {
+            pm.as_mut()
+                .fill_rect(v, &pp, Transform::identity(), None);
+        }
+        if let Some(h) =
+            tiny_skia::Rect::from_xywh(cx - half, plus_cy - half * 0.12, half * 2.0, half * 0.24)
+        {
+            pm.as_mut()
+                .fill_rect(h, &pp, Transform::identity(), None);
         }
 
         // 右侧：电量 + 时间
@@ -1552,8 +1633,20 @@ impl TopBar {
         if y < 0.0 || y > self.win_h as f32 || x < 0.0 || x > self.win_w as f32 {
             return None;
         }
+        // 桌面缩略图组
+        if x >= self.desk_x - 4.0 && x <= self.desk_x + self.desk_w + 14.0 {
+            return Some(3);
+        }
+        // 加号
+        if x >= self.plus_x - 3.0 && x <= self.plus_x + self.plus_w + 3.0 {
+            return Some(4);
+        }
+        // 文字按钮
         let mut cx = self.pad;
         for (i, (label, _)) in self.buttons.iter().enumerate() {
+            if i == 2 {
+                cx = self.plus_x + self.plus_w + self.gap;
+            }
             let w = text_width(label, self.font_px);
             if x >= cx - self.gap * 0.5 && x <= cx + w + self.gap * 0.5 {
                 return Some(i);
@@ -1561,6 +1654,16 @@ impl TopBar {
             cx += w + self.gap;
         }
         None
+    }
+
+    fn action_of(&self, idx: usize) -> Act {
+        match idx {
+            0 => Act::NewFile,
+            1 => Act::NewFolder,
+            2 => Act::Help,
+            3 => Act::ShowDesktops,
+            _ => Act::NewDesktop,
+        }
     }
 }
 
@@ -1707,12 +1810,23 @@ unsafe fn battery_charging() -> bool {
     st.ACLineStatus == 1
 }
 
+/// 模拟 Win+Tab 打开任务视图，多个虚拟桌面在那里并排可选
+unsafe fn show_task_view() {
+    use winapi::um::winuser::{keybd_event, KEYEVENTF_KEYUP, VK_LWIN, VK_TAB};
+
+    keybd_event(VK_LWIN as u8, 0, 0, 0);
+    keybd_event(VK_TAB as u8, 0, 0, 0);
+    keybd_event(VK_TAB as u8, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_LWIN as u8, 0, KEYEVENTF_KEYUP, 0);
+}
+
 fn do_action(act: Act) {
     match act {
         Act::Help => launch("https://github.com/changfengpolang191/RustDock/issues"),
         Act::NewFile => action_new_file(),
         Act::NewFolder => action_new_folder(),
-        Act::Desktops => unsafe { new_virtual_desktop() },
+        Act::ShowDesktops => unsafe { show_task_view() },
+        Act::NewDesktop => unsafe { new_virtual_desktop() },
     }
 }
 
@@ -1765,7 +1879,7 @@ unsafe extern "system" fn topbar_wndproc(
                 None => None,
             };
             if let Some(i) = act {
-                let a = TOPBAR.as_ref().map(|tb| tb.buttons[i].1);
+                let a = TOPBAR.as_ref().map(|tb| tb.action_of(i));
                 if let Some(a) = a {
                     do_action(a);
                 }
