@@ -14,6 +14,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
+use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use tiny_skia::{
     FillRule, FilterQuality, Paint, Path as SkPath, PathBuilder, Pixmap, PixmapPaint, Transform,
 };
@@ -239,6 +240,114 @@ impl Dock {
             && px <= l.bar_x + l.bar_w + self.gap
             && py >= l.top - self.gap
             && py <= self.win_h as f32
+    }
+}
+
+// ── 文字渲染 ──
+// tiny-skia 只能画路径和图像，文字要靠 ab_glyph 把字形光栅化成覆盖率，
+// 再逐像素混合进 Pixmap（预乘 RGBA）。
+static mut FONT: Option<FontArc> = None;
+
+fn font() -> Option<&'static FontArc> {
+    unsafe {
+        if FONT.is_none() {
+            // 微软雅黑覆盖中英文；没有就退到 Segoe UI
+            for path in [
+                "C:\\Windows\\Fonts\\msyh.ttc",
+                "C:\\Windows\\Fonts\\msyhl.ttc",
+                "C:\\Windows\\Fonts\\segoeui.ttf",
+            ] {
+                if let Ok(data) = std::fs::read(path) {
+                    if let Ok(f) = FontArc::try_from_vec(data) {
+                        FONT = Some(f);
+                        break;
+                    }
+                }
+            }
+            if FONT.is_none() {
+                debug_log("font: 没有可用的字体文件");
+            }
+        }
+        FONT.as_ref()
+    }
+}
+
+/// 以覆盖率 cov 把 color 混合到 (x, y)。目标已是预乘，源也按预乘算
+fn blend_px(pm: &mut Pixmap, x: i32, y: i32, color: [u8; 4], cov: f32) {
+    if cov <= 0.0 {
+        return;
+    }
+    let (w, h) = (pm.width() as i32, pm.height() as i32);
+    if x < 0 || y < 0 || x >= w || y >= h {
+        return;
+    }
+    let idx = ((y as u32 * w as u32 + x as u32) * 4) as usize;
+    let sa = (color[3] as f32 / 255.0) * cov.min(1.0);
+    if sa <= 0.0 {
+        return;
+    }
+    let d = pm.data_mut();
+    let sr = (color[0] as f32 / 255.0) * sa;
+    let sg = (color[1] as f32 / 255.0) * sa;
+    let sb = (color[2] as f32 / 255.0) * sa;
+    let dr = d[idx] as f32 / 255.0;
+    let dg = d[idx + 1] as f32 / 255.0;
+    let db = d[idx + 2] as f32 / 255.0;
+    let da = d[idx + 3] as f32 / 255.0;
+    // 预乘空间的 over
+    d[idx] = ((sr + dr * (1.0 - sa)) * 255.0) as u8;
+    d[idx + 1] = ((sg + dg * (1.0 - sa)) * 255.0) as u8;
+    d[idx + 2] = ((sb + db * (1.0 - sa)) * 255.0) as u8;
+    d[idx + 3] = ((sa + da * (1.0 - sa)) * 255.0) as u8;
+}
+
+/// 画一行文字，top_y 是视觉顶部。返回结束时的 x
+fn draw_text(pm: &mut Pixmap, text: &str, x: f32, top_y: f32, px: f32, color: [u8; 4]) -> f32 {
+    let f = match font() {
+        Some(f) => f,
+        None => return x,
+    };
+    let scale = PxScale::from(px);
+    let sfont = f.as_scaled(scale);
+    let baseline = top_y + sfont.ascent();
+    let mut caret = x;
+    for ch in text.chars() {
+        let gid = f.glyph_id(ch);
+        let glyph = gid.with_scale_and_position(scale, ab_glyph::point(caret, baseline));
+        if let Some(outline) = f.outline_glyph(glyph) {
+            let bb = outline.px_bounds();
+            outline.draw(|gx, gy, c| {
+                blend_px(
+                    pm,
+                    bb.min.x as i32 + gx as i32,
+                    bb.min.y as i32 + gy as i32,
+                    color,
+                    c,
+                );
+            });
+        }
+        caret += sfont.h_advance(gid);
+    }
+    caret
+}
+
+fn text_width(text: &str, px: f32) -> f32 {
+    let f = match font() {
+        Some(f) => f,
+        None => return 0.0,
+    };
+    let scale = PxScale::from(px);
+    let sfont = f.as_scaled(scale);
+    text.chars().map(|c| sfont.h_advance(f.glyph_id(c))).sum()
+}
+
+fn now_hhmm() -> String {
+    use winapi::um::minwinbase::SYSTEMTIME;
+    use winapi::um::sysinfoapi::GetLocalTime;
+    unsafe {
+        let mut st: SYSTEMTIME = zeroed();
+        GetLocalTime(&mut st);
+        format!("{:02}:{:02}", st.wHour, st.wMinute)
     }
 }
 
@@ -1225,6 +1334,180 @@ unsafe fn set_desktop_icons_hidden(hide: bool) -> bool {
     toggle_desktop_icons()
 }
 
+// ── 顶部栏 ──
+const TOPBAR_H: f32 = 26.0;
+const TOPBAR_ALPHA: u8 = 170;
+const TOPBAR_FONT_PX: f32 = 12.5;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Act {
+    NewFile,
+    NewFolder,
+    Desktops,
+    Help,
+}
+
+struct TopBar {
+    buttons: Vec<(&'static str, Act)>,
+    hover: Option<usize>,
+    win_w: i32,
+    win_h: i32,
+    pad: f32,
+    gap: f32,
+    font_px: f32,
+}
+
+impl TopBar {
+    fn new(scale: f32) -> Self {
+        let win_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        TopBar {
+            buttons: vec![
+                ("新建文件", Act::NewFile),
+                ("新建文件夹", Act::NewFolder),
+                ("桌面", Act::Desktops),
+                ("帮助", Act::Help),
+            ],
+            hover: None,
+            win_w,
+            win_h: (TOPBAR_H * scale).ceil() as i32,
+            pad: 14.0 * scale,
+            gap: 22.0 * scale,
+            font_px: TOPBAR_FONT_PX * scale,
+        }
+    }
+
+    fn render(&self) -> Pixmap {
+        let w = self.win_w.max(1) as u32;
+        let h = self.win_h.max(1) as u32;
+        let mut pm = match Pixmap::new(w, h) {
+            Some(p) => p,
+            None => return Pixmap::new(1, 1).unwrap(),
+        };
+
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(18, 18, 22, TOPBAR_ALPHA);
+        if let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, w as f32, h as f32) {
+            pm.as_mut()
+                .fill_rect(r, &paint, Transform::identity(), None);
+        }
+
+        let text_y = (self.win_h as f32 - self.font_px) / 2.0;
+        let mut x = self.pad;
+        for (i, (label, _)) in self.buttons.iter().enumerate() {
+            let color = if self.hover == Some(i) {
+                [255, 255, 255, 255]
+            } else {
+                [225, 225, 232, 255]
+            };
+            draw_text(&mut pm, label, x, text_y, self.font_px, color);
+            x += text_width(label, self.font_px) + self.gap;
+        }
+
+        // 右侧时间
+        let t = now_hhmm();
+        let tw = text_width(&t, self.font_px);
+        draw_text(
+            &mut pm,
+            &t,
+            self.win_w as f32 - self.pad - tw,
+            text_y,
+            self.font_px,
+            [225, 225, 232, 255],
+        );
+
+        pm
+    }
+
+    fn hit(&self, x: f32, y: f32) -> Option<usize> {
+        if y < 0.0 || y > self.win_h as f32 || x < 0.0 || x > self.win_w as f32 {
+            return None;
+        }
+        let mut cx = self.pad;
+        for (i, (label, _)) in self.buttons.iter().enumerate() {
+            let w = text_width(label, self.font_px);
+            if x >= cx - self.gap * 0.5 && x <= cx + w + self.gap * 0.5 {
+                return Some(i);
+            }
+            cx += w + self.gap;
+        }
+        None
+    }
+}
+
+static mut TOPBAR: Option<TopBar> = None;
+
+unsafe fn redraw_topbar(hwnd: HWND) {
+    if let Some(tb) = TOPBAR.as_ref() {
+        let pm = tb.render();
+        present(hwnd, &pm);
+    }
+}
+
+fn do_action(act: Act) {
+    match act {
+        Act::Help => launch("https://github.com/changfengpolang191/RustDock/issues"),
+        Act::NewFile => debug_log("action: 新建文件（待实现）"),
+        Act::NewFolder => debug_log("action: 新建文件夹（待实现）"),
+        Act::Desktops => debug_log("action: 桌面列表（待实现）"),
+    }
+}
+
+unsafe extern "system" fn topbar_wndproc(
+    hwnd: HWND,
+    msg: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_ERASEBKGND => 1,
+        WM_PAINT => 0,
+        // 时间每分钟变，用定时器定期重绘
+        WM_TIMER => {
+            redraw_topbar(hwnd);
+            0
+        }
+        WM_MOUSEMOVE => {
+            let mut tme: TRACKMOUSEEVENT = zeroed();
+            tme.cbSize = size_of::<TRACKMOUSEEVENT>() as u32;
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&mut tme);
+
+            if let Some(tb) = TOPBAR.as_mut() {
+                let h = tb.hit(px(lparam), py(lparam));
+                if h != tb.hover {
+                    tb.hover = h;
+                    redraw_topbar(hwnd);
+                }
+            }
+            0
+        }
+        WM_MOUSELEAVE => {
+            if let Some(tb) = TOPBAR.as_mut() {
+                if tb.hover.is_some() {
+                    tb.hover = None;
+                    redraw_topbar(hwnd);
+                }
+            }
+            0
+        }
+        WM_LBUTTONUP => {
+            let act = match TOPBAR.as_ref() {
+                Some(tb) => tb.hit(px(lparam), py(lparam)),
+                None => None,
+            };
+            if let Some(i) = act {
+                let a = TOPBAR.as_ref().map(|tb| tb.buttons[i].1);
+                if let Some(a) = a {
+                    do_action(a);
+                }
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
 fn main() {
     // --install-autostart / --uninstall-autostart 只改注册表，不开界面
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1334,6 +1617,56 @@ fn main() {
         );
 
         redraw(hwnd);
+
+        // ── 顶部栏 ──
+        TOPBAR = Some(TopBar::new(scale));
+        let (tb_w, tb_h) = match TOPBAR.as_ref() {
+            Some(t) => (t.win_w, t.win_h),
+            None => (0, 0),
+        };
+        let tb_class = wide("RustDockTopBar");
+        let tb_wc = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfnWndProc: Some(topbar_wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: null_mut(),
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW as *const u16),
+            hbrBackground: null_mut(),
+            lpszMenuName: null(),
+            lpszClassName: tb_class.as_ptr(),
+            hIconSm: null_mut(),
+        };
+        RegisterClassExW(&tb_wc);
+        let tb = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            tb_class.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            tb_w,
+            tb_h,
+            null_mut(),
+            null_mut(),
+            hinst,
+            null_mut(),
+        );
+        if !tb.is_null() {
+            SetWindowPos(
+                tb,
+                HWND_TOPMOST,
+                0,
+                0,
+                tb_w,
+                tb_h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            redraw_topbar(tb);
+            SetTimer(tb, 1, 1000, None);
+        }
 
         // 桌面图标由 Dock 接管，退出时还回去
         if set_desktop_icons_hidden(true) {
