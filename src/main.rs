@@ -947,15 +947,55 @@ unsafe extern "system" fn wndproc(
             }
             0
         }
-        // 空白处右键退出（正式的右键菜单是后续项，先给条活路）
+        // 右键菜单
         WM_RBUTTONUP => {
             let (cx, cy) = (px(lparam), py(lparam));
-            let on_icon = match DOCK.as_ref() {
-                Some(d) => d.hit(cx, cy).is_some(),
-                None => false,
+            let item = match DOCK.as_ref() {
+                Some(d) => d.hit(cx, cy).map(|i| d.items[i].exe.clone()),
+                None => None,
             };
-            if !on_icon {
-                PostQuitMessage(0);
+
+            let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return 0;
+            }
+            if item.is_some() {
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    IDM_OPEN_LOCATION,
+                    wide("打开文件位置").as_ptr(),
+                );
+                AppendMenuW(menu, MF_SEPARATOR, 0, null());
+            }
+            AppendMenuW(menu, MF_STRING, IDM_QUIT, wide("退出 Dock").as_ptr());
+
+            let mut pt = POINT {
+                x: cx as i32,
+                y: cy as i32,
+            };
+            ClientToScreen(hwnd, &mut pt);
+            // 前置一下，否则点击菜单外部时菜单不会收起
+            SetForegroundWindow(hwnd);
+            let cmd = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                pt.x,
+                pt.y,
+                0,
+                hwnd,
+                null_mut(),
+            );
+            DestroyMenu(menu);
+
+            match cmd as usize {
+                IDM_OPEN_LOCATION => {
+                    if let Some(exe) = item {
+                        open_file_location(&exe);
+                    }
+                }
+                IDM_QUIT => PostQuitMessage(0),
+                _ => {}
             }
             0
         }
@@ -1395,6 +1435,22 @@ unsafe fn set_desktop_icons_hidden(hide: bool) -> bool {
 const TOPBAR_H: f32 = 26.0;
 const TOPBAR_ALPHA: u8 = 170;
 const TOPBAR_FONT_PX: f32 = 12.5;
+
+const IDM_OPEN_LOCATION: usize = 1;
+const IDM_QUIT: usize = 2;
+
+/// 在资源管理器里打开文件所在目录（目录则直接打开）
+fn open_file_location(path: &str) {
+    let p = Path::new(path);
+    let target = if p.is_dir() {
+        p.to_path_buf()
+    } else {
+        p.parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| p.to_path_buf())
+    };
+    launch(&target.display().to_string());
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Act {
