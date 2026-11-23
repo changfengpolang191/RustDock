@@ -566,6 +566,27 @@ unsafe fn show_taskbar() {
 static mut RUNNING: Vec<String> = Vec::new();
 static mut DOCK_HWND: HWND = null_mut();
 
+/// 桌面、任务栏这些 shell 自己的窗口也是 explorer.exe 的，
+/// 它们永远存在，不能当作「资源管理器开了一个窗口」。
+unsafe fn is_shell_window(hwnd: HWND) -> bool {
+    let mut cls = [0u16; 64];
+    let n = GetClassNameW(hwnd, cls.as_mut_ptr(), 64);
+    if n <= 0 {
+        return false;
+    }
+    let name = String::from_utf16_lossy(&cls[..n as usize]);
+    matches!(
+        name.as_str(),
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "NotifyIconOverflowWindow"
+            | "TopLevelWindowForOverflowXamlIsland"
+            | "Windows.UI.Core.CoreWindow"
+    )
+}
+
 unsafe extern "system" fn collect_running_proc(hwnd: HWND, _: LPARAM) -> BOOL {
     if IsWindowVisible(hwnd) == 0 {
         return 1;
@@ -575,6 +596,9 @@ unsafe extern "system" fn collect_running_proc(hwnd: HWND, _: LPARAM) -> BOOL {
     }
     let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
     if ex & (WS_EX_TOOLWINDOW as i32) != 0 {
+        return 1;
+    }
+    if is_shell_window(hwnd) {
         return 1;
     }
     let mut pid: DWORD = 0;
@@ -655,6 +679,9 @@ unsafe extern "system" fn match_window_proc(hwnd: HWND, _: LPARAM) -> BOOL {
     // 跳过工具窗口（托盘图标之类）
     let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
     if ex & (WS_EX_TOOLWINDOW as i32) != 0 {
+        return 1;
+    }
+    if is_shell_window(hwnd) {
         return 1;
     }
 
