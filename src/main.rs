@@ -1111,6 +1111,10 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_DESTROY => {
+            if APPBAR_ON {
+                appbar_remove(hwnd);
+                APPBAR_ON = false;
+            }
             show_taskbar();
             if HID_DESKTOP_ICONS {
                 set_desktop_icons_hidden(false);
@@ -1120,9 +1124,20 @@ unsafe extern "system" fn wndproc(
             0
         }
         m => {
-            // explorer 重启会重建任务栏，收到通知再藏一次
+            // 系统重新布局时会通知 AppBar，重新声明占满屏幕
+            if m == WM_APPBAR_NOTIFY {
+                if APPBAR_ON {
+                    appbar_fill_screen(hwnd);
+                }
+                return 0;
+            }
+            // explorer 重启会重建任务栏，收到通知再处理一次
             if TASKBAR_CREATED_MSG != 0 && m == TASKBAR_CREATED_MSG {
-                hide_taskbar();
+                if APPBAR_ON {
+                    appbar_fill_screen(hwnd);
+                } else {
+                    hide_taskbar();
+                }
                 return 0;
             }
             DefWindowProcW(hwnd, m, wparam, lparam)
@@ -2028,6 +2043,47 @@ fn run_watchdog(parent_pid: u32) {
     // 恢复完立刻退出，不再走 main 的收尾流程
     std::process::exit(0);
 }
+
+// ── AppBar：把任务栏挤走 ──
+// Win11 的 XAML 任务栏不接受 SW_HIDE，反复移出屏幕也会被拉回来。
+// 标准做法是注册一个占满屏幕的 AppBar，系统重新布局时任务栏就无处安放了。
+const WM_APPBAR_NOTIFY: UINT = WM_USER + 1;
+
+unsafe fn appbar_register(hwnd: HWND) -> bool {
+    use winapi::um::shellapi::{APPBARDATA, ABM_NEW, SHAppBarMessage};
+
+    let mut abd: APPBARDATA = zeroed();
+    abd.cbSize = size_of::<APPBARDATA>() as DWORD;
+    abd.hWnd = hwnd;
+    abd.uCallbackMessage = WM_APPBAR_NOTIFY;
+    SHAppBarMessage(ABM_NEW, &mut abd) != 0
+}
+
+/// 声明占用整个屏幕，任务栏会被系统挤走
+unsafe fn appbar_fill_screen(hwnd: HWND) {
+    use winapi::um::shellapi::{APPBARDATA, ABE_TOP, ABM_SETPOS, SHAppBarMessage};
+
+    let mut abd: APPBARDATA = zeroed();
+    abd.cbSize = size_of::<APPBARDATA>() as DWORD;
+    abd.hWnd = hwnd;
+    abd.uEdge = ABE_TOP;
+    abd.rc.left = 0;
+    abd.rc.top = 0;
+    abd.rc.right = GetSystemMetrics(SM_CXSCREEN);
+    abd.rc.bottom = GetSystemMetrics(SM_CYSCREEN);
+    SHAppBarMessage(ABM_SETPOS, &mut abd);
+}
+
+unsafe fn appbar_remove(hwnd: HWND) {
+    use winapi::um::shellapi::{APPBARDATA, ABM_REMOVE, SHAppBarMessage};
+
+    let mut abd: APPBARDATA = zeroed();
+    abd.cbSize = size_of::<APPBARDATA>() as DWORD;
+    abd.hWnd = hwnd;
+    SHAppBarMessage(ABM_REMOVE, &mut abd);
+}
+
+static mut APPBAR_ON: bool = false;
 
 const IDM_OPEN_LOCATION: usize = 1;
 const IDM_QUIT: usize = 2;
@@ -3113,7 +3169,15 @@ fn main() {
         let x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
         let y = (base_y - win_h).max(0);
 
-        hide_taskbar();
+        // 优先用 AppBar 把任务栏挤走；失败再退回到移出屏幕
+        if appbar_register(hwnd) {
+            appbar_fill_screen(hwnd);
+            APPBAR_ON = true;
+            debug_log("appbar: 已注册并占满屏幕");
+        } else {
+            debug_log("appbar: 注册失败，回退到移出屏幕");
+            hide_taskbar();
+        }
 
         SetWindowPos(
             hwnd,
