@@ -1435,6 +1435,8 @@ unsafe fn set_desktop_icons_hidden(hide: bool) -> bool {
 const TOPBAR_H: f32 = 26.0;
 const TOPBAR_ALPHA: u8 = 170;
 const TOPBAR_FONT_PX: f32 = 12.5;
+// 鼠标停在音量上时向下展开的面板高度
+const PANEL_H: f32 = 130.0;
 
 // ── 系统音量（Core Audio）──
 // winapi 的 RIDL! 不生成 IID_XXX 常量，这里按 uuid 手写
@@ -1532,6 +1534,19 @@ unsafe fn toggle_mute() {
     }
 }
 
+/// 绝对设置音量 0~1
+unsafe fn set_volume_abs(v: f32) {
+    let c = volume_ctl();
+    if c.is_null() {
+        return;
+    }
+    (*c).SetMasterVolumeLevelScalar(v.clamp(0.0, 1.0), null());
+    let mut m: BOOL = 0;
+    if (*c).GetMute(&mut m) == 0 && m != 0 {
+        (*c).SetMute(0, null());
+    }
+}
+
 /// 相对调节音量，delta 是 0~1 的增量
 unsafe fn adjust_volume(delta: f32) {
     let c = volume_ctl();
@@ -1591,6 +1606,10 @@ struct TopBar {
     desk_h: f32,
     plus_x: f32,
     plus_w: f32,
+    scale: f32,
+    slider_h: f32,
+    panel_visible: bool,
+    dragging: bool,
 }
 
 impl TopBar {
@@ -1617,7 +1636,7 @@ impl TopBar {
             ],
             hover: None,
             win_w,
-            win_h: (TOPBAR_H * scale).ceil() as i32,
+            win_h: ((TOPBAR_H + PANEL_H) * scale).ceil() as i32,
             pad,
             gap,
             font_px,
@@ -1626,6 +1645,60 @@ impl TopBar {
             desk_h: dk_h,
             plus_x,
             plus_w: 14.0 * scale,
+            scale,
+            slider_h: PANEL_H * scale * 0.72,
+            panel_visible: false,
+            dragging: false,
+        }
+    }
+
+    fn bar_h(&self) -> f32 {
+        TOPBAR_H * self.scale
+    }
+
+    /// 音量滑块矩形（面板展开时使用），绘制、命中、拖动共用
+    fn slider_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        let t = now_hhmm();
+        let tw = text_width(&t, self.font_px);
+        let mut right = self.win_w as f32 - self.pad - tw;
+        unsafe {
+            if let Some(b) = battery_percent() {
+                let s = if battery_charging() {
+                    format!("{}%+", b)
+                } else {
+                    format!("{}%", b)
+                };
+                right -= self.gap + text_width(&s, self.font_px);
+            }
+            if let Some(v) = system_volume() {
+                let s = if is_muted() {
+                    "静音".to_string()
+                } else {
+                    format!("{}%", v)
+                };
+                let vw = text_width(&s, self.font_px);
+                let vx = right - self.gap - vw;
+                let sw = 9.0 * self.scale;
+                return Some((
+                    vx + vw / 2.0 - sw / 2.0,
+                    self.bar_h() + 8.0,
+                    sw,
+                    self.slider_h,
+                ));
+            }
+        }
+        None
+    }
+
+    fn in_panel(&self, x: f32, y: f32) -> bool {
+        if !self.panel_visible {
+            return false;
+        }
+        match self.slider_rect() {
+            Some((sx, sy, sw, sh)) => {
+                x >= sx - 12.0 && x <= sx + sw + 12.0 && y >= sy - 6.0 && y <= sy + sh + 8.0
+            }
+            None => false,
         }
     }
 
@@ -1639,12 +1712,13 @@ impl TopBar {
 
         let mut paint = Paint::default();
         paint.set_color_rgba8(18, 18, 22, TOPBAR_ALPHA);
-        if let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, w as f32, h as f32) {
+        let bar_h = self.bar_h();
+        if let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, w as f32, bar_h) {
             pm.as_mut()
                 .fill_rect(r, &paint, Transform::identity(), None);
         }
 
-        let text_y = (self.win_h as f32 - self.font_px) / 2.0;
+        let text_y = (bar_h - self.font_px) / 2.0;
 
         // 前两个按钮
         let mut x = self.pad;
@@ -1664,7 +1738,7 @@ impl TopBar {
 
         // 桌面缩略图组：三张层叠的小卡片，最上面那张代表当前桌面
         let step = 5.0 * (self.desk_h / 10.0);
-        let cy = (self.win_h as f32 - self.desk_h) / 2.0;
+        let cy = (bar_h - self.desk_h) / 2.0;
         let hover_desk = self.hover == Some(3);
         let hover_plus = self.hover == Some(4);
         for k in 0..3 {
@@ -1693,7 +1767,7 @@ impl TopBar {
         );
 
         // 加号（两条细矩形拼成十字）
-        let plus_cy = self.win_h as f32 / 2.0;
+        let plus_cy = bar_h / 2.0;
         let mut pp = Paint::default();
         let a = if hover_plus { 255 } else { 210 };
         pp.set_color_rgba8(235, 235, 245, a);
@@ -1753,11 +1827,41 @@ impl TopBar {
             draw_text(&mut pm, &s, right, text_y, self.font_px, color);
         }
 
+        // 音量面板：悬停时向下展开的竖直滑块
+        if self.panel_visible {
+            if let Some((sx, sy, sw, sh)) = self.slider_rect() {
+                let panel = rounded_rect(sx - 9.0, sy - 6.0, sw + 18.0, sh + 12.0, 9.0);
+                let mut bp = Paint::default();
+                bp.set_color_rgba8(20, 20, 26, 225);
+                bp.anti_alias = true;
+                pm.as_mut()
+                    .fill_path(&panel, &bp, FillRule::Winding, Transform::identity(), None);
+
+                let track = rounded_rect(sx, sy, sw, sh, sw / 2.0);
+                let mut tp = Paint::default();
+                tp.set_color_rgba8(85, 85, 100, 230);
+                tp.anti_alias = true;
+                pm.as_mut()
+                    .fill_path(&track, &tp, FillRule::Winding, Transform::identity(), None);
+
+                let v = unsafe { system_volume() }.unwrap_or(0) as f32 / 100.0;
+                let fh = (sh * v).max(0.0);
+                if fh > 0.5 {
+                    let fill = rounded_rect(sx, sy + sh - fh, sw, fh, sw / 2.0);
+                    let mut fp = Paint::default();
+                    fp.set_color_rgba8(120, 190, 255, 245);
+                    fp.anti_alias = true;
+                    pm.as_mut()
+                        .fill_path(&fill, &fp, FillRule::Winding, Transform::identity(), None);
+                }
+            }
+        }
+
         pm
     }
 
     fn hit(&self, x: f32, y: f32) -> Option<usize> {
-        if y < 0.0 || y > self.win_h as f32 || x < 0.0 || x > self.win_w as f32 {
+        if y < 0.0 || y > self.bar_h() || x < 0.0 || x > self.win_w as f32 {
             return None;
         }
         // 桌面缩略图组
@@ -2031,25 +2135,90 @@ unsafe extern "system" fn topbar_wndproc(
             tme.hwndTrack = hwnd;
             TrackMouseEvent(&mut tme);
 
+            let (x, y) = (px(lparam), py(lparam));
+            let mut dirty = false;
             if let Some(tb) = TOPBAR.as_mut() {
-                let h = tb.hit(px(lparam), py(lparam));
+                let h = tb.hit(x, y);
+                let show = h == Some(5) || tb.in_panel(x, y) || tb.dragging;
+                if show != tb.panel_visible {
+                    tb.panel_visible = show;
+                    dirty = true;
+                }
+                if tb.dragging {
+                    if let Some((_, sy, _, sh)) = tb.slider_rect() {
+                        let v = 1.0 - ((y - sy) / sh).clamp(0.0, 1.0);
+                        set_volume_abs(v);
+                        dirty = true;
+                    }
+                }
                 if h != tb.hover {
                     tb.hover = h;
-                    redraw_topbar(hwnd);
+                    dirty = true;
                 }
+            }
+            if dirty {
+                redraw_topbar(hwnd);
             }
             0
         }
         WM_MOUSELEAVE => {
+            let mut dirty = false;
             if let Some(tb) = TOPBAR.as_mut() {
-                if tb.hover.is_some() {
-                    tb.hover = None;
-                    redraw_topbar(hwnd);
+                tb.hover = None;
+                if !tb.dragging && tb.panel_visible {
+                    tb.panel_visible = false;
                 }
+                dirty = true;
+            }
+            if dirty {
+                redraw_topbar(hwnd);
             }
             0
         }
+        WM_LBUTTONDOWN => {
+            let (x, y) = (px(lparam), py(lparam));
+            let in_panel = TOPBAR.as_ref().map(|tb| tb.in_panel(x, y)).unwrap_or(false);
+            if in_panel {
+                if let Some(tb) = TOPBAR.as_mut() {
+                    tb.dragging = true;
+                    if let Some((_, sy, _, sh)) = tb.slider_rect() {
+                        let v = 1.0 - ((y - sy) / sh).clamp(0.0, 1.0);
+                        set_volume_abs(v);
+                    }
+                }
+                redraw_topbar(hwnd);
+            }
+            0
+        }
+        WM_NCHITTEST => {
+            let mut pt = POINT {
+                x: px(lparam) as i32,
+                y: py(lparam) as i32,
+            };
+            ScreenToClient(hwnd, &mut pt);
+            let ok = match TOPBAR.as_ref() {
+                Some(tb) => {
+                    let (x, y) = (pt.x as f32, pt.y as f32);
+                    (y >= 0.0 && y <= tb.bar_h()) || tb.in_panel(x, y)
+                }
+                None => false,
+            };
+            if ok {
+                HTCLIENT as LRESULT
+            } else {
+                HTTRANSPARENT as LRESULT
+            }
+        }
         WM_LBUTTONUP => {
+            // 刚拖完滑块就别再当成点击，否则松手会误触发静音
+            let was_dragging = TOPBAR.as_ref().map(|tb| tb.dragging).unwrap_or(false);
+            if let Some(tb) = TOPBAR.as_mut() {
+                tb.dragging = false;
+            }
+            if was_dragging {
+                redraw_topbar(hwnd);
+                return 0;
+            }
             let act = match TOPBAR.as_ref() {
                 Some(tb) => tb.hit(px(lparam), py(lparam)),
                 None => None,
