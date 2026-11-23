@@ -384,7 +384,9 @@ unsafe fn taskbar_window() -> HWND {
     FindWindowW(wide("Shell_TrayWnd").as_ptr(), null())
 }
 
-/// 把任务栏移到屏幕下方之外，并记住原位置
+/// 隐藏任务栏：直接藏窗口。
+/// 只把它移出屏幕不够 —— Win11 的自动隐藏在鼠标触底时会把它拉回来显示，
+/// 所以这里改成 ShowWindow(SW_HIDE)。
 unsafe fn hide_taskbar() {
     let tray = taskbar_window();
     if tray.is_null() {
@@ -393,21 +395,12 @@ unsafe fn hide_taskbar() {
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let mut rc: RECT = zeroed();
     if GetWindowRect(tray, &mut rc) != 0 && rc.top < sh - 2 {
-        // 只有原本就在屏幕内才记录，避免把"已经被藏起来的位置"当成原始位置
         TASKBAR_ORIG = rc;
     }
-    SetWindowPos(
-        tray,
-        null_mut(),
-        rc.left,
-        sh,
-        0,
-        0,
-        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
-    );
+    ShowWindow(tray, SW_HIDE);
     TASKBAR_HIDDEN = true;
     debug_log(&format!(
-        "taskbar: 已移出屏幕，原位置 top={}",
+        "taskbar: 已隐藏，原位置 top={}",
         TASKBAR_ORIG.top
     ));
 }
@@ -420,8 +413,8 @@ unsafe fn show_taskbar() {
     if tray.is_null() {
         return;
     }
+    ShowWindow(tray, SW_SHOW);
     let sh = GetSystemMetrics(SM_CYSCREEN);
-    // 原始位置不可用时贴屏幕底
     let top = if TASKBAR_ORIG.top > 0 && TASKBAR_ORIG.top <= sh {
         TASKBAR_ORIG.top
     } else {
@@ -1321,15 +1314,12 @@ fn main() {
             return;
         }
 
-        // 隐藏系统任务栏，Dock 贴屏幕底
-        hide_taskbar();
-        let base_y = if TASKBAR_HIDDEN {
-            GetSystemMetrics(SM_CYSCREEN) - (MARGIN * scale) as i32
-        } else {
-            dock_base_y(scale)
-        };
+        // Dock 始终按任务栏停靠位置让出空隙
+        let base_y = dock_base_y(scale);
         let x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
         let y = (base_y - win_h).max(0);
+
+        hide_taskbar();
 
         SetWindowPos(
             hwnd,
