@@ -1532,6 +1532,25 @@ unsafe fn toggle_mute() {
     }
 }
 
+/// 相对调节音量，delta 是 0~1 的增量
+unsafe fn adjust_volume(delta: f32) {
+    let c = volume_ctl();
+    if c.is_null() {
+        return;
+    }
+    let mut v: f32 = 0.0;
+    if (*c).GetMasterVolumeLevelScalar(&mut v) != 0 {
+        return;
+    }
+    let next = (v + delta).clamp(0.0, 1.0);
+    (*c).SetMasterVolumeLevelScalar(next, null());
+    // 调音量时自动解除静音，否则滚半天没声音
+    let mut m: BOOL = 0;
+    if (*c).GetMute(&mut m) == 0 && m != 0 {
+        (*c).SetMute(0, null());
+    }
+}
+
 const IDM_OPEN_LOCATION: usize = 1;
 const IDM_QUIT: usize = 2;
 
@@ -2039,7 +2058,27 @@ unsafe extern "system" fn topbar_wndproc(
                 let a = TOPBAR.as_ref().map(|tb| tb.action_of(i));
                 if let Some(a) = a {
                     do_action(a);
+                    redraw_topbar(hwnd);
                 }
+            }
+            0
+        }
+        // 滚轮调音量：WM_MOUSEWHEEL 给的是屏幕坐标
+        WM_MOUSEWHEEL => {
+            let delta = ((wparam >> 16) & 0xFFFF) as i16;
+            let mut pt = POINT {
+                x: px(lparam) as i32,
+                y: py(lparam) as i32,
+            };
+            ScreenToClient(hwnd, &mut pt);
+            let on_volume = match TOPBAR.as_ref() {
+                Some(tb) => tb.hit(pt.x as f32, pt.y as f32) == Some(5),
+                None => false,
+            };
+            if on_volume {
+                let step = if delta > 0 { 0.05 } else { -0.05 };
+                adjust_volume(step);
+                redraw_topbar(hwnd);
             }
             0
         }
