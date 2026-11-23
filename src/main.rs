@@ -1436,6 +1436,102 @@ const TOPBAR_H: f32 = 26.0;
 const TOPBAR_ALPHA: u8 = 170;
 const TOPBAR_FONT_PX: f32 = 12.5;
 
+// ── 系统音量（Core Audio）──
+// winapi 的 RIDL! 不生成 IID_XXX 常量，这里按 uuid 手写
+const IID_IMMDEVICEENUMERATOR: winapi::shared::guiddef::GUID = winapi::shared::guiddef::GUID {
+    Data1: 0xa95664d2,
+    Data2: 0x9614,
+    Data3: 0x4f35,
+    Data4: [0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6],
+};
+const IID_IAUDIOENDPOINTVOLUME: winapi::shared::guiddef::GUID = winapi::shared::guiddef::GUID {
+    Data1: 0x5cdf2c82,
+    Data2: 0x841e,
+    Data3: 0x4546,
+    Data4: [0x97, 0x22, 0x0c, 0xf7, 0x40, 0x78, 0x22, 0x9a],
+};
+
+static mut VOLUME_CTL: *mut winapi::um::endpointvolume::IAudioEndpointVolume = null_mut();
+
+unsafe fn volume_ctl() -> *mut winapi::um::endpointvolume::IAudioEndpointVolume {
+    use winapi::um::combaseapi::{CoCreateInstance, CLSCTX_ALL};
+    use winapi::um::endpointvolume::IAudioEndpointVolume;
+    use winapi::um::mmdeviceapi::{
+        eConsole, eRender, IMMDevice, IMMDeviceEnumerator, CLSID_MMDeviceEnumerator,
+    };
+
+    if !VOLUME_CTL.is_null() {
+        return VOLUME_CTL;
+    }
+
+    let mut enumr: *mut IMMDeviceEnumerator = null_mut();
+    let hr = CoCreateInstance(
+        &CLSID_MMDeviceEnumerator,
+        null_mut(),
+        CLSCTX_ALL,
+        &IID_IMMDEVICEENUMERATOR,
+        &mut enumr as *mut _ as *mut _,
+    );
+    if hr != 0 || enumr.is_null() {
+        debug_log(&format!("volume: CoCreateInstance 失败 hr=0x{:X}", hr));
+        return null_mut();
+    }
+
+    let mut dev: *mut IMMDevice = null_mut();
+    let hr = (*enumr).GetDefaultAudioEndpoint(eRender, eConsole, &mut dev);
+    if hr != 0 || dev.is_null() {
+        debug_log(&format!("volume: 取默认设备失败 hr=0x{:X}", hr));
+        return null_mut();
+    }
+
+    let mut vol: *mut IAudioEndpointVolume = null_mut();
+    let hr = (*dev).Activate(
+        &IID_IAUDIOENDPOINTVOLUME,
+        CLSCTX_ALL,
+        null_mut(),
+        &mut vol as *mut _ as *mut _,
+    );
+    if hr != 0 || vol.is_null() {
+        debug_log(&format!("volume: Activate 失败 hr=0x{:X}", hr));
+        return null_mut();
+    }
+    VOLUME_CTL = vol;
+    vol
+}
+
+/// 主音量百分比 0~100
+unsafe fn system_volume() -> Option<u8> {
+    let c = volume_ctl();
+    if c.is_null() {
+        return None;
+    }
+    let mut v: f32 = 0.0;
+    if (*c).GetMasterVolumeLevelScalar(&mut v) != 0 {
+        return None;
+    }
+    Some((v * 100.0).round().clamp(0.0, 100.0) as u8)
+}
+
+unsafe fn is_muted() -> bool {
+    let c = volume_ctl();
+    if c.is_null() {
+        return false;
+    }
+    let mut m: BOOL = 0;
+    (*c).GetMute(&mut m) == 0 && m != 0
+}
+
+unsafe fn toggle_mute() {
+    let c = volume_ctl();
+    if c.is_null() {
+        return;
+    }
+    let mut m: BOOL = 0;
+    if (*c).GetMute(&mut m) == 0 {
+        (*c).SetMute(if m != 0 { 0 } else { 1 }, null());
+    }
+}
+
 const IDM_OPEN_LOCATION: usize = 1;
 const IDM_QUIT: usize = 2;
 
@@ -1459,6 +1555,7 @@ enum Act {
     ShowDesktops,
     NewDesktop,
     Help,
+    ToggleMute,
 }
 
 struct TopBar {
@@ -1597,10 +1694,10 @@ impl TopBar {
                 .fill_rect(h, &pp, Transform::identity(), None);
         }
 
-        // 右侧：电量 + 时间
+        // 右侧：时间 / 电量 / 音量，从右往左排
         let t = now_hhmm();
         let tw = text_width(&t, self.font_px);
-        let right = self.win_w as f32 - self.pad - tw;
+        let mut right = self.win_w as f32 - self.pad - tw;
         draw_text(&mut pm, &t, right, text_y, self.font_px, [225, 225, 232, 255]);
 
         if let Some(b) = unsafe { battery_percent() } {
@@ -1611,19 +1708,30 @@ impl TopBar {
                 format!("{}%", b)
             };
             let bw = text_width(&s, self.font_px);
+            right -= self.gap + bw;
             let color = if !charging && b <= 20 {
                 [255, 150, 140, 255]
             } else {
                 [200, 200, 210, 255]
             };
-            draw_text(
-                &mut pm,
-                &s,
-                right - self.gap - bw,
-                text_y,
-                self.font_px,
-                color,
-            );
+            draw_text(&mut pm, &s, right, text_y, self.font_px, color);
+        }
+
+        if let Some(v) = unsafe { system_volume() } {
+            let muted = unsafe { is_muted() };
+            let s = if muted {
+                "静音".to_string()
+            } else {
+                format!("{}%", v)
+            };
+            let vw = text_width(&s, self.font_px);
+            right -= self.gap + vw;
+            let color = if muted {
+                [255, 150, 140, 255]
+            } else {
+                [200, 200, 210, 255]
+            };
+            draw_text(&mut pm, &s, right, text_y, self.font_px, color);
         }
 
         pm
@@ -1653,6 +1761,26 @@ impl TopBar {
             }
             cx += w + self.gap;
         }
+        // 音量文字
+        if let Some(vx) = self.volume_x() {
+            let w = unsafe {
+                if system_volume().is_some() {
+                    text_width(
+                        &if is_muted() {
+                            "静音".to_string()
+                        } else {
+                            format!("{}%", system_volume().unwrap_or(0))
+                        },
+                        self.font_px,
+                    )
+                } else {
+                    0.0
+                }
+            };
+            if x >= vx - 6.0 && x <= vx + w + 6.0 {
+                return Some(5);
+            }
+        }
         None
     }
 
@@ -1662,8 +1790,36 @@ impl TopBar {
             1 => Act::NewFolder,
             2 => Act::Help,
             3 => Act::ShowDesktops,
-            _ => Act::NewDesktop,
+            4 => Act::NewDesktop,
+            _ => Act::ToggleMute,
         }
+    }
+
+    /// 右侧音量文字的左边界，点击静音
+    fn volume_x(&self) -> Option<f32> {
+        let t = now_hhmm();
+        let tw = text_width(&t, self.font_px);
+        let mut right = self.win_w as f32 - self.pad - tw;
+        unsafe {
+            if let Some(b) = battery_percent() {
+                let s = if battery_charging() {
+                    format!("{}%+", b)
+                } else {
+                    format!("{}%", b)
+                };
+                right -= self.gap + text_width(&s, self.font_px);
+            }
+            if let Some(v) = system_volume() {
+                let s = if is_muted() {
+                    "静音".to_string()
+                } else {
+                    format!("{}%", v)
+                };
+                let vw = text_width(&s, self.font_px);
+                return Some(right - self.gap - vw);
+            }
+        }
+        None
     }
 }
 
@@ -1827,6 +1983,7 @@ fn do_action(act: Act) {
         Act::NewFolder => action_new_folder(),
         Act::ShowDesktops => unsafe { show_task_view() },
         Act::NewDesktop => unsafe { new_virtual_desktop() },
+        Act::ToggleMute => unsafe { toggle_mute() },
     }
 }
 

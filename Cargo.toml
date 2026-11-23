@@ -20,6 +20,12 @@ winapi = { version = "0.3", features = [
     "handleapi",
     "sysinfoapi",
     "commdlg",
+    "mmdeviceapi",
+    "endpointvolume",
+    "combaseapi",
+    "objbase",
+    "wtypesbase",
+    "unknwnbase",
     "minwindef",
     "windef",
 ] }
