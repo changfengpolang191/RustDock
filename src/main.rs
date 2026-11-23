@@ -1403,17 +1403,34 @@ impl TopBar {
             x += text_width(label, self.font_px) + self.gap;
         }
 
-        // 右侧时间
+        // 右侧：电量 + 时间
         let t = now_hhmm();
         let tw = text_width(&t, self.font_px);
-        draw_text(
-            &mut pm,
-            &t,
-            self.win_w as f32 - self.pad - tw,
-            text_y,
-            self.font_px,
-            [225, 225, 232, 255],
-        );
+        let right = self.win_w as f32 - self.pad - tw;
+        draw_text(&mut pm, &t, right, text_y, self.font_px, [225, 225, 232, 255]);
+
+        if let Some(b) = unsafe { battery_percent() } {
+            let charging = unsafe { battery_charging() };
+            let s = if charging {
+                format!("{}%+", b)
+            } else {
+                format!("{}%", b)
+            };
+            let bw = text_width(&s, self.font_px);
+            let color = if !charging && b <= 20 {
+                [255, 150, 140, 255]
+            } else {
+                [200, 200, 210, 255]
+            };
+            draw_text(
+                &mut pm,
+                &s,
+                right - self.gap - bw,
+                text_y,
+                self.font_px,
+                color,
+            );
+        }
 
         pm
     }
@@ -1443,12 +1460,146 @@ unsafe fn redraw_topbar(hwnd: HWND) {
     }
 }
 
+/// 弹系统「另存为」对话框拿路径。filters 为空时当成选文件夹名用
+unsafe fn pick_save_path(
+    title: &str,
+    def_ext: &str,
+    filters: &[(&str, &str)],
+    overwrite: bool,
+) -> Option<PathBuf> {
+    use winapi::um::commdlg::{
+        GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_NOVALIDATE, OFN_OVERWRITEPROMPT,
+        OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+
+    let mut file_buf = [0u16; 512];
+    let mut filter: Vec<u16> = Vec::new();
+    for (name, pat) in filters {
+        filter.extend(name.encode_utf16());
+        filter.push(0);
+        filter.extend(pat.encode_utf16());
+        filter.push(0);
+    }
+    filter.push(0);
+    if filters.is_empty() {
+        filter.push(0);
+    }
+
+    let title_w = wide(title);
+    let ext_w = wide(def_ext);
+
+    let mut ofn: OPENFILENAMEW = zeroed();
+    ofn.lStructSize = size_of::<OPENFILENAMEW>() as DWORD;
+    ofn.lpstrFilter = if filters.is_empty() {
+        null()
+    } else {
+        filter.as_ptr()
+    };
+    ofn.lpstrFile = file_buf.as_mut_ptr();
+    ofn.nMaxFile = file_buf.len() as DWORD;
+    ofn.lpstrTitle = title_w.as_ptr();
+    let mut flags = OFN_NOCHANGEDIR | OFN_NOVALIDATE | OFN_PATHMUSTEXIST;
+    if overwrite {
+        flags |= OFN_OVERWRITEPROMPT;
+    }
+    ofn.Flags = flags;
+    if !def_ext.is_empty() {
+        ofn.lpstrDefExt = ext_w.as_ptr();
+    }
+
+    if GetSaveFileNameW(&mut ofn) == 0 {
+        return None;
+    }
+    let len = file_buf.iter().position(|&c| c == 0).unwrap_or(0);
+    if len == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(&file_buf[..len])))
+}
+
+fn action_new_file() {
+    let filters = [
+        ("文本文档 (*.txt)", "*.txt"),
+        ("Markdown (*.md)", "*.md"),
+        ("Word 文档 (*.docx)", "*.docx"),
+        ("Excel 表格 (*.xlsx)", "*.xlsx"),
+        ("所有文件 (*.*)", "*.*"),
+    ];
+    unsafe {
+        if let Some(p) = pick_save_path("新建文件", "txt", &filters, true) {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&p)
+            {
+                Ok(_) => {
+                    debug_log(&format!("new_file: {}", p.display()));
+                    launch(&p.display().to_string());
+                }
+                Err(e) => debug_log(&format!("new_file 失败: {} ({})", p.display(), e)),
+            }
+        }
+    }
+}
+
+fn action_new_folder() {
+    unsafe {
+        if let Some(p) = pick_save_path("新建文件夹", "", &[], false) {
+            match std::fs::create_dir_all(&p) {
+                Ok(_) => {
+                    debug_log(&format!("new_folder: {}", p.display()));
+                    launch(&p.display().to_string());
+                }
+                Err(e) => debug_log(&format!("new_folder 失败: {} ({})", p.display(), e)),
+            }
+        }
+    }
+}
+
+/// 模拟 Win+Ctrl+D 新建虚拟桌面
+unsafe fn new_virtual_desktop() {
+    use winapi::um::winuser::{keybd_event, KEYEVENTF_KEYUP, VK_CONTROL, VK_LWIN};
+
+    keybd_event(VK_LWIN as u8, 0, 0, 0);
+    keybd_event(VK_CONTROL as u8, 0, 0, 0);
+    keybd_event(b'D', 0, 0, 0);
+    keybd_event(b'D', 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_CONTROL as u8, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_LWIN as u8, 0, KEYEVENTF_KEYUP, 0);
+}
+
+/// 电池剩余百分比。没有电池（台式机）或读数未知时返回 None
+unsafe fn battery_percent() -> Option<u8> {
+    use winapi::um::winbase::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+
+    let mut st: SYSTEM_POWER_STATUS = zeroed();
+    if GetSystemPowerStatus(&mut st) == 0 {
+        return None;
+    }
+    if st.BatteryLifePercent == 255 {
+        return None;
+    }
+    Some(st.BatteryLifePercent)
+}
+
+/// 是否接着电源
+unsafe fn battery_charging() -> bool {
+    use winapi::um::winbase::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+
+    let mut st: SYSTEM_POWER_STATUS = zeroed();
+    if GetSystemPowerStatus(&mut st) == 0 {
+        return false;
+    }
+    st.ACLineStatus == 1
+}
+
 fn do_action(act: Act) {
     match act {
         Act::Help => launch("https://github.com/changfengpolang191/RustDock/issues"),
-        Act::NewFile => debug_log("action: 新建文件（待实现）"),
-        Act::NewFolder => debug_log("action: 新建文件夹（待实现）"),
-        Act::Desktops => debug_log("action: 桌面列表（待实现）"),
+        Act::NewFile => action_new_file(),
+        Act::NewFolder => action_new_folder(),
+        Act::Desktops => unsafe { new_virtual_desktop() },
     }
 }
 
