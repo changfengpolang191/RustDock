@@ -26,6 +26,8 @@ winapi = { version = "0.3", features = [
     "objbase",
     "wtypesbase",
     "unknwnbase",
+    "commctrl",
+    "memoryapi",
     "minwindef",
     "windef",
 ] }

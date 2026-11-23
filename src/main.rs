@@ -1566,6 +1566,261 @@ unsafe fn adjust_volume(delta: f32) {
     }
 }
 
+// ── 托盘区 ──
+// explorer 把托盘图标放在 Shell_TrayWnd / TrayNotifyWnd / SysPager / ToolbarWindow32
+// 里。按钮数据只存在于 explorer 进程的地址空间，必须跨进程读。
+#[repr(C)]
+struct TrayData {
+    hwnd: HWND,
+    u_id: UINT,
+    u_callback_message: UINT,
+    reserved: [DWORD; 2],
+    h_icon: HICON,
+}
+
+struct TrayIcon {
+    owner: HWND,
+    u_id: UINT,
+    callback: UINT,
+    icon: Option<Pixmap>,
+}
+
+static mut TRAY_ICONS: Vec<TrayIcon> = Vec::new();
+static mut TRAY_TICK: u32 = 0;
+static mut TOPBAR_HWND: HWND = null_mut();
+
+/// 当前前台窗口的标题，用来在菜单栏显示正在用的程序
+unsafe fn foreground_title() -> Option<String> {
+    let fg = GetForegroundWindow();
+    if fg.is_null() || fg == DOCK_HWND || fg == TOPBAR_HWND {
+        return None;
+    }
+    let mut buf = [0u16; 256];
+    let n = GetWindowTextW(fg, buf.as_mut_ptr(), 256);
+    if n <= 0 {
+        return None;
+    }
+    let s = String::from_utf16_lossy(&buf[..n as usize]);
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+unsafe fn tray_toolbar() -> HWND {
+    let shell = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
+    if shell.is_null() {
+        return null_mut();
+    }
+    let notify = FindWindowExW(shell, null_mut(), wide("TrayNotifyWnd").as_ptr(), null());
+    if notify.is_null() {
+        return null_mut();
+    }
+    let pager = FindWindowExW(notify, null_mut(), wide("SysPager").as_ptr(), null());
+    if pager.is_null() {
+        return null_mut();
+    }
+    FindWindowExW(pager, null_mut(), wide("ToolbarWindow32").as_ptr(), null())
+}
+
+unsafe fn refresh_tray() {
+    use winapi::um::commctrl::{
+        ImageList_GetIcon, HIMAGELIST, ILD_TRANSPARENT, TB_BUTTONCOUNT, TB_GETBUTTON,
+        TB_GETIMAGELIST,
+    };
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::memoryapi::{ReadProcessMemory, VirtualAllocEx, VirtualFreeEx};
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::winnt::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+        PROCESS_VM_WRITE,
+    };
+
+    TRAY_ICONS.clear();
+    let bar = tray_toolbar();
+    if bar.is_null() {
+        debug_log("tray: 找不到托盘工具栏");
+        return;
+    }
+
+    let mut pid: DWORD = 0;
+    GetWindowThreadProcessId(bar, &mut pid);
+    if pid == 0 {
+        return;
+    }
+    let proc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE, 0, pid);
+    if proc.is_null() {
+        debug_log("tray: OpenProcess 失败（权限不足）");
+        return;
+    }
+
+    let count = SendMessageW(bar, TB_BUTTONCOUNT, 0, 0) as i32;
+    // sizeof(TBBUTTON) 在 x64 上是 32 字节
+    let tbb_size = 32usize;
+    let remote = VirtualAllocEx(
+        proc,
+        null_mut(),
+        tbb_size,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    );
+    if remote.is_null() {
+        CloseHandle(proc);
+        return;
+    }
+
+    let himl = SendMessageW(bar, TB_GETIMAGELIST, 0, 0) as HIMAGELIST;
+
+    for i in 0..count {
+        let mut tbb = [0u8; 32];
+        if SendMessageW(bar, TB_GETBUTTON, i as usize, remote as isize) == 0 {
+            continue;
+        }
+        let mut read: usize = 0;
+        if ReadProcessMemory(
+            proc,
+            remote,
+            tbb.as_mut_ptr() as *mut _,
+            tbb_size,
+            &mut read,
+        ) == 0
+        {
+            continue;
+        }
+        // dwData 在 x64 的 offset 16，指向 explorer 里的 TRAYDATA
+        let dw_data = usize::from_ne_bytes([
+            tbb[16], tbb[17], tbb[18], tbb[19], tbb[20], tbb[21], tbb[22], tbb[23],
+        ]) as LPVOID;
+        if dw_data.is_null() {
+            continue;
+        }
+        let mut td: TrayData = zeroed();
+        if ReadProcessMemory(
+            proc,
+            dw_data,
+            &mut td as *mut TrayData as *mut _,
+            size_of::<TrayData>(),
+            &mut read,
+        ) == 0
+        {
+            continue;
+        }
+        if td.hwnd.is_null() || IsWindow(td.hwnd) == 0 {
+            continue;
+        }
+
+        // 图标从工具栏的 image list 取，比 TRAYDATA.hIcon 可靠
+        let icon = if !himl.is_null() {
+            let hicon = ImageList_GetIcon(himl, i, ILD_TRANSPARENT);
+            if hicon.is_null() {
+                None
+            } else {
+                let pm = hicon_to_pixmap(hicon);
+                DestroyIcon(hicon);
+                pm
+            }
+        } else {
+            None
+        };
+
+        TRAY_ICONS.push(TrayIcon {
+            owner: td.hwnd,
+            u_id: td.u_id,
+            callback: td.u_callback_message,
+            icon,
+        });
+    }
+
+    let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+    CloseHandle(proc);
+    debug_log(&format!("tray: 读到 {} 个图标", TRAY_ICONS.len()));
+}
+
+/// 模拟点击托盘图标：给图标所属窗口发它注册的回调消息
+unsafe fn click_tray(idx: usize) {
+    if let Some(t) = TRAY_ICONS.get(idx) {
+        PostMessageW(
+            t.owner,
+            t.callback,
+            t.u_id as WPARAM,
+            WM_LBUTTONUP as LPARAM,
+        );
+    }
+}
+
+// ── 屏幕亮度（笔记本内置屏，走 WMI）──
+// WMI 只能经由 COM 或 PowerShell 访问；这里用 PowerShell 起子进程，
+// 放到后台线程里跑，避免拖动/悬停时卡住消息循环。
+static mut BRIGHTNESS: u16 = 0xFFFF; // 0xFFFF = 未读到
+
+fn read_brightness_async() {
+    std::thread::spawn(|| {
+        let out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness).CurrentBrightness",
+            ])
+            .output();
+        if let Ok(o) = out {
+            let s = String::from_utf8_lossy(&o.stdout);
+            if let Ok(v) = s.trim().parse::<u16>() {
+                unsafe {
+                    BRIGHTNESS = v;
+                }
+                debug_log(&format!("brightness: {}", v));
+            }
+        }
+    });
+}
+
+fn set_brightness_async(v: u16) {
+    let v = v.min(100);
+    unsafe {
+        BRIGHTNESS = v;
+    }
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods).WmiSetBrightness(1,{})",
+                    v
+                ),
+            ])
+            .output();
+    });
+}
+
+/// 画一个竖直滑块面板：深色底 + 轨道 + 蓝色填充
+fn draw_slider_panel(pm: &mut Pixmap, sx: f32, sy: f32, sw: f32, sh: f32, v: f32) {
+    let panel = rounded_rect(sx - 9.0, sy - 6.0, sw + 18.0, sh + 12.0, 9.0);
+    let mut bp = Paint::default();
+    bp.set_color_rgba8(20, 20, 26, 225);
+    bp.anti_alias = true;
+    pm.as_mut()
+        .fill_path(&panel, &bp, FillRule::Winding, Transform::identity(), None);
+
+    let track = rounded_rect(sx, sy, sw, sh, sw / 2.0);
+    let mut tp = Paint::default();
+    tp.set_color_rgba8(85, 85, 100, 230);
+    tp.anti_alias = true;
+    pm.as_mut()
+        .fill_path(&track, &tp, FillRule::Winding, Transform::identity(), None);
+
+    let fh = (sh * v.clamp(0.0, 1.0)).max(0.0);
+    if fh > 0.5 {
+        let fill = rounded_rect(sx, sy + sh - fh, sw, fh, sw / 2.0);
+        let mut fp = Paint::default();
+        fp.set_color_rgba8(120, 190, 255, 245);
+        fp.anti_alias = true;
+        pm.as_mut()
+            .fill_path(&fill, &fp, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
 const IDM_OPEN_LOCATION: usize = 1;
 const IDM_QUIT: usize = 2;
 
@@ -1590,6 +1845,10 @@ enum Act {
     NewDesktop,
     Help,
     ToggleMute,
+    WifiSettings,
+    BtSettings,
+    ToggleTaskbar,
+    NoOp,
 }
 
 struct TopBar {
@@ -1610,6 +1869,8 @@ struct TopBar {
     slider_h: f32,
     panel_visible: bool,
     dragging: bool,
+    bright_panel: bool,
+    bright_dragging: bool,
 }
 
 impl TopBar {
@@ -1649,11 +1910,61 @@ impl TopBar {
             slider_h: PANEL_H * scale * 0.72,
             panel_visible: false,
             dragging: false,
+            bright_panel: false,
+            bright_dragging: false,
+        }
+    }
+
+    /// 亮度滑块矩形
+    fn bright_slider_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        let s = self.bright_text()?;
+        let (nx, _, _) = self.net_span();
+        let w = text_width(&s, self.font_px);
+        let bx = nx - self.gap - w;
+        let sw = 9.0 * self.scale;
+        Some((
+            bx + w / 2.0 - sw / 2.0,
+            self.bar_h() + 8.0,
+            sw,
+            self.slider_h,
+        ))
+    }
+
+    fn in_bright_panel(&self, x: f32, y: f32) -> bool {
+        if !self.bright_panel {
+            return false;
+        }
+        match self.bright_slider_rect() {
+            Some((sx, sy, sw, sh)) => {
+                x >= sx - 12.0 && x <= sx + sw + 12.0 && y >= sy - 6.0 && y <= sy + sh + 8.0
+            }
+            None => false,
         }
     }
 
     fn bar_h(&self) -> f32 {
         TOPBAR_H * self.scale
+    }
+
+    /// 右侧内容的左起点（没有音频设备时退回时间左边）
+    fn right_anchor(&self) -> f32 {
+        match self.volume_x() {
+            Some(vx) => vx,
+            None => {
+                let t = now_hhmm();
+                self.win_w as f32 - self.pad - text_width(&t, self.font_px) - self.gap
+            }
+        }
+    }
+
+    /// 托盘图标占的横向区间
+    fn tray_span(&self) -> (f32, f32, f32, usize) {
+        let n = unsafe { TRAY_ICONS.len().min(12) };
+        let isz = 15.0 * self.scale;
+        let step = isz + 5.0 * self.scale;
+        let total = n as f32 * step;
+        let start = self.right_anchor() - total - self.gap;
+        (start, step, isz, n)
     }
 
     /// 音量滑块矩形（面板展开时使用），绘制、命中、拖动共用
@@ -1787,6 +2098,28 @@ impl TopBar {
                 .fill_rect(h, &pp, Transform::identity(), None);
         }
 
+        // 当前应用标题：跟在「帮助」后面
+        if let Some(t) = unsafe { foreground_title() } {
+            let tx = self.plus_x
+                + self.plus_w
+                + self.gap
+                + text_width("帮助", self.font_px)
+                + self.gap;
+            let mut shown: String = t;
+            let max_w = 300.0 * self.scale;
+            while text_width(&shown, self.font_px) > max_w && shown.chars().count() > 1 {
+                shown.pop();
+            }
+            draw_text(
+                &mut pm,
+                &shown,
+                tx,
+                text_y,
+                self.font_px,
+                [165, 165, 178, 255],
+            );
+        }
+
         // 右侧：时间 / 电量 / 音量，从右往左排
         let t = now_hhmm();
         let tw = text_width(&t, self.font_px);
@@ -1827,33 +2160,94 @@ impl TopBar {
             draw_text(&mut pm, &s, right, text_y, self.font_px, color);
         }
 
+        // 亮度（WiFi 左边）
+        if let Some(s) = self.bright_text() {
+            let (nx, _, _) = self.net_span();
+            let w = text_width(&s, self.font_px);
+            let bx = nx - self.gap - w;
+            let c = if self.hover == Some(8) {
+                [255, 255, 255, 255]
+            } else {
+                [200, 200, 210, 255]
+            };
+            draw_text(&mut pm, &s, bx, text_y, self.font_px, c);
+        }
+
+        // WiFi / 蓝牙入口（托盘左边）
+        {
+            let (nx, w1, _) = self.net_span();
+            let c1 = if self.hover == Some(6) {
+                [255, 255, 255, 255]
+            } else {
+                [200, 200, 210, 255]
+            };
+            draw_text(&mut pm, "WiFi", nx, text_y, self.font_px, c1);
+            let c2 = if self.hover == Some(7) {
+                [255, 255, 255, 255]
+            } else {
+                [200, 200, 210, 255]
+            };
+            draw_text(
+                &mut pm,
+                "蓝牙",
+                nx + w1 + self.gap,
+                text_y,
+                self.font_px,
+                c2,
+            );
+        }
+
+        // 托盘图标（排在音量左边）
+        {
+            let (start, step, isz, n) = self.tray_span();
+            if n > 0 {
+                let ty = (bar_h - isz) / 2.0;
+                let mut tx = start;
+                unsafe {
+                    for k in 0..n {
+                        if let Some(icon) = TRAY_ICONS[k].icon.as_ref() {
+                            let sx = isz / icon.width().max(1) as f32;
+                            let sy = isz / icon.height().max(1) as f32;
+                            let mut pp = PixmapPaint::default();
+                            pp.quality = FilterQuality::Bilinear;
+                            pm.as_mut().draw_pixmap(
+                                0,
+                                0,
+                                icon.as_ref(),
+                                &pp,
+                                Transform::from_scale(sx, sy).post_translate(tx, ty),
+                                None,
+                            );
+                        }
+                        tx += step;
+                    }
+                }
+            } else {
+                // Win11 的托盘是 XAML 渲染的，枚举不到图标。
+                // 退而求其次：给个入口切换任务栏显隐，托盘就在那上面。
+                let c = if self.hover == Some(9) {
+                    [255, 255, 255, 255]
+                } else {
+                    [200, 200, 210, 255]
+                };
+                draw_text(&mut pm, "托盘", start, text_y, self.font_px, c);
+            }
+        }
+
         // 音量面板：悬停时向下展开的竖直滑块
         if self.panel_visible {
             if let Some((sx, sy, sw, sh)) = self.slider_rect() {
-                let panel = rounded_rect(sx - 9.0, sy - 6.0, sw + 18.0, sh + 12.0, 9.0);
-                let mut bp = Paint::default();
-                bp.set_color_rgba8(20, 20, 26, 225);
-                bp.anti_alias = true;
-                pm.as_mut()
-                    .fill_path(&panel, &bp, FillRule::Winding, Transform::identity(), None);
-
-                let track = rounded_rect(sx, sy, sw, sh, sw / 2.0);
-                let mut tp = Paint::default();
-                tp.set_color_rgba8(85, 85, 100, 230);
-                tp.anti_alias = true;
-                pm.as_mut()
-                    .fill_path(&track, &tp, FillRule::Winding, Transform::identity(), None);
-
                 let v = unsafe { system_volume() }.unwrap_or(0) as f32 / 100.0;
-                let fh = (sh * v).max(0.0);
-                if fh > 0.5 {
-                    let fill = rounded_rect(sx, sy + sh - fh, sw, fh, sw / 2.0);
-                    let mut fp = Paint::default();
-                    fp.set_color_rgba8(120, 190, 255, 245);
-                    fp.anti_alias = true;
-                    pm.as_mut()
-                        .fill_path(&fill, &fp, FillRule::Winding, Transform::identity(), None);
-                }
+                draw_slider_panel(&mut pm, sx, sy, sw, sh, v);
+            }
+        }
+
+        // 亮度面板
+        if self.bright_panel {
+            if let Some((sx, sy, sw, sh)) = self.bright_slider_rect() {
+                let b = unsafe { BRIGHTNESS };
+                let v = if b == 0xFFFF { 0.0 } else { b as f32 / 100.0 };
+                draw_slider_panel(&mut pm, sx, sy, sw, sh, v);
             }
         }
 
@@ -1883,6 +2277,42 @@ impl TopBar {
                 return Some(i);
             }
             cx += w + self.gap;
+        }
+        // 亮度
+        if let Some(s) = self.bright_text() {
+            let (nx, _, _) = self.net_span();
+            let w = text_width(&s, self.font_px);
+            let bx = nx - self.gap - w;
+            if x >= bx - 3.0 && x <= bx + w + 3.0 {
+                return Some(8);
+            }
+        }
+        // WiFi / 蓝牙
+        {
+            let (nx, w1, w2) = self.net_span();
+            if x >= nx - 2.0 && x <= nx + w1 + 2.0 {
+                return Some(6);
+            }
+            let bx = nx + w1 + self.gap;
+            if x >= bx - 2.0 && x <= bx + w2 + 2.0 {
+                return Some(7);
+            }
+        }
+        // 托盘图标
+        {
+            let (start, step, _, n) = self.tray_span();
+            if n == 0 {
+                // 没有图标时这块是「托盘」入口
+                let w = text_width("托盘", self.font_px);
+                if x >= start - 2.0 && x <= start + w + 2.0 {
+                    return Some(9);
+                }
+            } else if n > 0 && x >= start - 2.0 && x < start + step * n as f32 {
+                let k = ((x - start) / step) as usize;
+                if k < n {
+                    return Some(10 + k);
+                }
+            }
         }
         // 音量文字
         if let Some(vx) = self.volume_x() {
@@ -1914,7 +2344,31 @@ impl TopBar {
             2 => Act::Help,
             3 => Act::ShowDesktops,
             4 => Act::NewDesktop,
+            5 => Act::ToggleMute,
+            6 => Act::WifiSettings,
+            7 => Act::BtSettings,
+            8 => Act::NoOp,
+            9 => Act::ToggleTaskbar,
             _ => Act::ToggleMute,
+        }
+    }
+
+    /// WiFi / 蓝牙两个小按钮的位置（托盘左边）
+    fn net_span(&self) -> (f32, f32, f32) {
+        let (tray_start, _, _, _) = self.tray_span();
+        let w1 = text_width("WiFi", self.font_px);
+        let w2 = text_width("蓝牙", self.font_px);
+        let total = w1 + self.gap + w2;
+        (tray_start - total - self.gap, w1, w2)
+    }
+
+    /// 亮度文字位置（WiFi 左边）
+    fn bright_text(&self) -> Option<String> {
+        let b = unsafe { BRIGHTNESS };
+        if b == 0xFFFF {
+            None
+        } else {
+            Some(format!("亮{}%", b))
         }
     }
 
@@ -2107,6 +2561,16 @@ fn do_action(act: Act) {
         Act::ShowDesktops => unsafe { show_task_view() },
         Act::NewDesktop => unsafe { new_virtual_desktop() },
         Act::ToggleMute => unsafe { toggle_mute() },
+        Act::WifiSettings => launch("ms-settings:network-wifi"),
+        Act::BtSettings => launch("ms-settings:bluetooth"),
+        Act::ToggleTaskbar => unsafe {
+            if TASKBAR_HIDDEN {
+                show_taskbar();
+            } else {
+                hide_taskbar();
+            }
+        },
+        Act::NoOp => {}
     }
 }
 
@@ -2122,6 +2586,13 @@ unsafe extern "system" fn topbar_wndproc(
         // 时间每分钟变，用定时器定期重绘；顺便刷新运行中应用集合
         WM_TIMER => {
             refresh_running();
+            // 托盘图标跨进程读取较重，两秒刷一次
+            unsafe {
+                TRAY_TICK = TRAY_TICK.wrapping_add(1);
+                if TRAY_TICK % 2 == 0 {
+                    refresh_tray();
+                }
+            }
             redraw_topbar(hwnd);
             if !DOCK_HWND.is_null() {
                 redraw(DOCK_HWND);
@@ -2144,10 +2615,22 @@ unsafe extern "system" fn topbar_wndproc(
                     tb.panel_visible = show;
                     dirty = true;
                 }
+                let show_b = h == Some(8) || tb.in_bright_panel(x, y) || tb.bright_dragging;
+                if show_b != tb.bright_panel {
+                    tb.bright_panel = show_b;
+                    dirty = true;
+                }
                 if tb.dragging {
                     if let Some((_, sy, _, sh)) = tb.slider_rect() {
                         let v = 1.0 - ((y - sy) / sh).clamp(0.0, 1.0);
                         set_volume_abs(v);
+                        dirty = true;
+                    }
+                }
+                if tb.bright_dragging {
+                    if let Some((_, sy, _, sh)) = tb.bright_slider_rect() {
+                        let v = (1.0 - ((y - sy) / sh).clamp(0.0, 1.0)) * 100.0;
+                        BRIGHTNESS = v as u16;
                         dirty = true;
                     }
                 }
@@ -2168,6 +2651,9 @@ unsafe extern "system" fn topbar_wndproc(
                 if !tb.dragging && tb.panel_visible {
                     tb.panel_visible = false;
                 }
+                if !tb.bright_dragging && tb.bright_panel {
+                    tb.bright_panel = false;
+                }
                 dirty = true;
             }
             if dirty {
@@ -2178,12 +2664,25 @@ unsafe extern "system" fn topbar_wndproc(
         WM_LBUTTONDOWN => {
             let (x, y) = (px(lparam), py(lparam));
             let in_panel = TOPBAR.as_ref().map(|tb| tb.in_panel(x, y)).unwrap_or(false);
-            if in_panel {
+            let in_bright = TOPBAR
+                .as_ref()
+                .map(|tb| tb.in_bright_panel(x, y))
+                .unwrap_or(false);
+            if in_panel || in_bright {
                 if let Some(tb) = TOPBAR.as_mut() {
-                    tb.dragging = true;
-                    if let Some((_, sy, _, sh)) = tb.slider_rect() {
-                        let v = 1.0 - ((y - sy) / sh).clamp(0.0, 1.0);
-                        set_volume_abs(v);
+                    if in_panel {
+                        tb.dragging = true;
+                        if let Some((_, sy, _, sh)) = tb.slider_rect() {
+                            let v = 1.0 - ((y - sy) / sh).clamp(0.0, 1.0);
+                            set_volume_abs(v);
+                        }
+                    }
+                    if in_bright {
+                        tb.bright_dragging = true;
+                        if let Some((_, sy, _, sh)) = tb.bright_slider_rect() {
+                            let v = (1.0 - ((y - sy) / sh).clamp(0.0, 1.0)) * 100.0;
+                            BRIGHTNESS = v as u16;
+                        }
                     }
                 }
                 redraw_topbar(hwnd);
@@ -2199,7 +2698,9 @@ unsafe extern "system" fn topbar_wndproc(
             let ok = match TOPBAR.as_ref() {
                 Some(tb) => {
                     let (x, y) = (pt.x as f32, pt.y as f32);
-                    (y >= 0.0 && y <= tb.bar_h()) || tb.in_panel(x, y)
+                    (y >= 0.0 && y <= tb.bar_h())
+                        || tb.in_panel(x, y)
+                        || tb.in_bright_panel(x, y)
                 }
                 None => false,
             };
@@ -2211,11 +2712,19 @@ unsafe extern "system" fn topbar_wndproc(
         }
         WM_LBUTTONUP => {
             // 刚拖完滑块就别再当成点击，否则松手会误触发静音
-            let was_dragging = TOPBAR.as_ref().map(|tb| tb.dragging).unwrap_or(false);
+            let was_dragging = TOPBAR
+                .as_ref()
+                .map(|tb| tb.dragging || tb.bright_dragging)
+                .unwrap_or(false);
             if let Some(tb) = TOPBAR.as_mut() {
                 tb.dragging = false;
+                tb.bright_dragging = false;
             }
             if was_dragging {
+                let b = unsafe { BRIGHTNESS };
+                if b != 0xFFFF {
+                    set_brightness_async(b);
+                }
                 redraw_topbar(hwnd);
                 return 0;
             }
@@ -2224,6 +2733,11 @@ unsafe extern "system" fn topbar_wndproc(
                 None => None,
             };
             if let Some(i) = act {
+                // 10 以上是托盘图标，转发点击给对应程序
+                if i >= 10 {
+                    unsafe { click_tray(i - 10) };
+                    return 0;
+                }
                 let a = TOPBAR.as_ref().map(|tb| tb.action_of(i));
                 if let Some(a) = a {
                     do_action(a);
@@ -2232,7 +2746,7 @@ unsafe extern "system" fn topbar_wndproc(
             }
             0
         }
-        // 滚轮调音量：WM_MOUSEWHEEL 给的是屏幕坐标
+        // 滚轮：音量区调音量，亮度区调亮度
         WM_MOUSEWHEEL => {
             let delta = ((wparam >> 16) & 0xFFFF) as i16;
             let mut pt = POINT {
@@ -2240,14 +2754,28 @@ unsafe extern "system" fn topbar_wndproc(
                 y: py(lparam) as i32,
             };
             ScreenToClient(hwnd, &mut pt);
-            let on_volume = match TOPBAR.as_ref() {
-                Some(tb) => tb.hit(pt.x as f32, pt.y as f32) == Some(5),
-                None => false,
+            let hit = match TOPBAR.as_ref() {
+                Some(tb) => tb.hit(pt.x as f32, pt.y as f32),
+                None => None,
             };
-            if on_volume {
-                let step = if delta > 0 { 0.05 } else { -0.05 };
-                adjust_volume(step);
-                redraw_topbar(hwnd);
+            match hit {
+                Some(5) => {
+                    adjust_volume(if delta > 0 { 0.05 } else { -0.05 });
+                    redraw_topbar(hwnd);
+                }
+                Some(8) => {
+                    let cur = unsafe { BRIGHTNESS };
+                    if cur != 0xFFFF {
+                        let next = if delta > 0 {
+                            (cur + 5).min(100)
+                        } else {
+                            cur.saturating_sub(5)
+                        };
+                        set_brightness_async(next);
+                        redraw_topbar(hwnd);
+                    }
+                }
+                _ => {}
             }
             0
         }
@@ -2256,6 +2784,8 @@ unsafe extern "system" fn topbar_wndproc(
 }
 
 fn main() {
+    use winapi::um::combaseapi::CoInitializeEx;
+    use winapi::um::objbase::COINIT_APARTMENTTHREADED;
     // --install-autostart / --uninstall-autostart 只改注册表，不开界面
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--install-autostart") {
@@ -2285,6 +2815,10 @@ fn main() {
     }
 
     unsafe {
+        // Core Audio 等 COM 接口必须先初始化，否则 CoCreateInstance 返回
+        // CO_E_NOTINITIALIZED (0x800401F0)
+        CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED);
+
         SetProcessDPIAware(); // 不声明就是 DPI 虚化，150% 缩放下会很糊
 
         let dc = GetDC(null_mut());
@@ -2414,8 +2948,11 @@ fn main() {
                 tb_h,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
-            redraw_topbar(tb);
-            SetTimer(tb, 1, 1000, None);
+        redraw_topbar(tb);
+        SetTimer(tb, 1, 1000, None);
+        TOPBAR_HWND = tb;
+        // 启动时后台读一次亮度，不阻塞界面
+        read_brightness_async();
         }
 
         // 桌面图标由 Dock 接管，退出时还回去
